@@ -1,0 +1,37 @@
+{
+  "name": "miningos-wrk-ext-mempool",
+  "version": "0.0.1",
+  "description": "MiningOS Mempool Worker",
+  "keywords": [
+    "tether"
+  ],
+  "author": "Tether",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tetherto/miningos-wrk-ext-mempool.git"
+  },
+  "engine": {
+    "node": ">=20.0"
+  },
+  "scripts": {
+    "lint": "standard",
+    "lint:fix": "standard --fix",
+    "test": "npm run lint && npm run test:unit",
+    "test:unit": "brittle tests/unit/*.js",
+    "test:coverage": "brittle --coverage tests/{,**/}*.test.js"
+  },
+  "dependencies": {
+    "async": "3.2.6",
+    "bfx-facs-http": "git+https://github.com/bitfinexcom/bfx-facs-http.git",
+    "bfx-facs-interval": "git+https://github.com/bitfinexcom/bfx-facs-interval.git",
+    "hp-svc-facs-store": "git+https://github.com/tetherto/hp-svc-facs-store.git",
+    "lib-js-util-base": "git+https://github.com/bitfinexcom/lib-js-util-base.git",
+    "mingo": "6.5.6",
+    "tether-wrk-base": "git+https://github.com/tetherto/tether-wrk-base.git"
+  },
+  "devDependencies": {
+    "brittle": "3.16.3",
+    "standard": "17.1.2"
+  }
+}

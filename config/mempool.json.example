@@ -1,0 +1,5 @@
+{
+    "baseUrl": "https://mempool.space/api",
+    "dataFetchIntervalMs": 1800000,
+    "historicalDataFetchIntervalMs": 43200000
+}
