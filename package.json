@@ -11,9 +11,22 @@
     "type": "git",
     "url": "git+https://github.com/tetherto/miningos-wrk-ext-mempool.git"
   },
-  "engine": {
-    "node": ">=20.0"
+  "homepage": "https://github.com/tetherto/miningos-wrk-ext-mempool#readme",
+  "bugs": {
+    "url": "https://github.com/tetherto/miningos-wrk-ext-mempool/issues"
+  },  
+  "engines": {
+    "node": ">=20"
   },
+  "files": [
+    "worker.js",
+    "workers/"
+  ],
+  "main": "worker.js",  
+  "type": "commonjs",
+  "bin": {
+    "miningos-wrk-ext-mempool": "worker.js"
+  },  
   "scripts": {
     "lint": "standard",
     "lint:fix": "standard --fix",
