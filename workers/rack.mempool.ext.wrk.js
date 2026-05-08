@@ -1,7 +1,7 @@
 'use strict'
 
 const async = require('async')
-const TetherWrkBase = require('tether-wrk-base/workers/base.wrk.tether')
+const TetherWrkBase = require('@tetherto/tether-wrk-base/workers/base.wrk.tether')
 const MempoolApi = require('./lib/mempool.api')
 const { setTimeout: sleep } = require('timers/promises')
 const {
@@ -15,8 +15,8 @@ const {
   HISTORICAL_HASHRATE_DATA_KEY
 } = require('./lib/constants')
 const { getUTCMidnightTwoYearsAgo, getUTCMidnightTimestampsLast2Years, getUTCMidnightToday } = require('./lib/utils')
-const utilsStore = require('hp-svc-facs-store/utils')
-const gLibUtilBase = require('lib-js-util-base')
+const utilsStore = require('@tetherto/hp-svc-facs-store/utils')
+const gLibUtilBase = require('@bitfinex/lib-js-util-base')
 const mingo = require('mingo')
 
 class WrkMempoolRack extends TetherWrkBase {
@@ -51,12 +51,12 @@ class WrkMempoolRack extends TetherWrkBase {
     this.loadConf('mempool', 'mempool')
 
     this.setInitFacs([
-      ['fac', 'hp-svc-facs-store', 's1', 's1', {
+      ['fac', '@tetherto/hp-svc-facs-store', 's1', 's1', {
         storePrimaryKey: this.ctx.storePrimaryKey,
         storeDir: `store/${this.ctx.rack}-db`
       }, 0],
-      ['fac', 'bfx-facs-interval', '0', 'mempool', {}, -10],
-      ['fac', 'bfx-facs-http', '0', '0', {
+      ['fac', '@bitfinex/bfx-facs-interval', '0', 'mempool', {}, -10],
+      ['fac', '@bitfinex/bfx-facs-http', '0', '0', {
         baseUrl: this.conf.mempool.baseUrl,
         timeout: 30 * 1000
       }, 0]
