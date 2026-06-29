@@ -8,15 +8,32 @@ inputs:
   node-version:
     description: Node.js version (must match setup job)
     required: true
+  working-directory:
+    description: Directory containing package.json (use . for repo root)
+    required: false
+    default: '.'
 
 runs:
   using: composite
   steps:
+    - name: Resolve node_modules path
+      id: paths
+      shell: bash
+      env:
+        PKG_DIR: ${{ inputs.working-directory }}
+      run: |
+        WD="${PKG_DIR:-.}"
+        if [ "$WD" = "." ]; then
+          echo "node-modules-path=node_modules" >> "$GITHUB_OUTPUT"
+        else
+          echo "node-modules-path=${WD}/node_modules" >> "$GITHUB_OUTPUT"
+        fi
+
     - name: Restore node_modules cache
       id: cache-node-modules
       uses: actions/cache/restore@v4
       with:
-        path: node_modules
+        path: ${{ steps.paths.outputs.node-modules-path }}
         key: ${{ inputs.cache-key }}
         restore-keys: |
           node-modules-${{ runner.os }}-
@@ -29,9 +46,16 @@ runs:
     - name: Install dependencies
       if: steps.cache-node-modules.outputs.cache-hit != 'true'
       shell: bash
+      env:
+        PKG_DIR: ${{ inputs.working-directory }}
       run: |
+        set -euo pipefail
+        WD="${PKG_DIR:-.}"
+        if [ "$WD" != "." ]; then
+          cd "$WD"
+        fi
         if [ -f package-lock.json ]; then
-          npm ci
+          npm ci --ignore-scripts --no-audit --no-fund
         else
-          npm install
+          npm install --ignore-scripts --no-audit --no-fund
         fi
