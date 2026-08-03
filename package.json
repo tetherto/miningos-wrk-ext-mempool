@@ -1,6 +1,6 @@
 {
   "name": "@tetherto/miningos-wrk-ext-mempool",
-  "version": "0.0.1",
+  "version": "1.1.0",
   "description": "MiningOS Mempool Worker",
   "keywords": [
     "tether"
@@ -16,7 +16,7 @@
     "url": "https://github.com/tetherto/miningos-wrk-ext-mempool/issues"
   },  
   "engines": {
-    "node": ">=20"
+    "node": ">=24"
   },
   "files": [
     "worker.js",
