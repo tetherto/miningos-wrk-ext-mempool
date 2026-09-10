@@ -329,7 +329,7 @@ class WrkMempoolRack extends TetherWrkBase {
     await db.close()
   }
 
-  async _getDbData (key, { start, end, limit = 100 }) {
+  async _getDbData (key, { start, end, limit }) {
     const db = await this._getBee(key)
     const stream = db.createReadStream({
       gte: utilsStore.convIntToBin(start),

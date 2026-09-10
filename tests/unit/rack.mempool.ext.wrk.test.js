@@ -286,6 +286,23 @@ test('_saveToDbKey, _getDbData and _getBee use bee db correctly', async (t) => {
   t.is(closed, 2)
 })
 
+test('_getDbData does not default a limit', async (t) => {
+  const wrk = Object.create(WrkMempoolRack.prototype)
+  let range
+
+  wrk.store_s1 = {
+    getBee: async () => ({
+      ready: async () => {},
+      close: async () => {},
+      createReadStream: async function * (r) { range = r }
+    })
+  }
+
+  await wrk._getDbData('k1', { start: 1, end: 3 })
+
+  t.is(range.limit, undefined)
+})
+
 test('fetchMempoolData populates state and saves payload', async (t) => {
   const wrk = Object.create(WrkMempoolRack.prototype)
   let saved = null
