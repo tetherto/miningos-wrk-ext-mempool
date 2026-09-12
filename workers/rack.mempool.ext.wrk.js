@@ -12,9 +12,10 @@ const {
   STAT_BLOCKSIZES,
   HISTORICAL_BLOCKSIZES_DATA_KEY,
   STAT_HASHRATE_HISTORY,
-  HISTORICAL_HASHRATE_DATA_KEY
+  HISTORICAL_HASHRATE_DATA_KEY,
+  HISTORICAL_DATA_START_TS
 } = require('./lib/constants')
-const { getUTCMidnightTwoYearsAgo, getUTCMidnightTimestampsLast2Years, getUTCMidnightToday } = require('./lib/utils')
+const { getUTCMidnightTimestampsSince, getUTCMidnightToday } = require('./lib/utils')
 const utilsStore = require('@tetherto/hp-svc-facs-store/utils')
 const gLibUtilBase = require('@bitfinex/lib-js-util-base')
 const mingo = require('mingo')
@@ -92,7 +93,7 @@ class WrkMempoolRack extends TetherWrkBase {
         try {
           await this.saveHistoricalData()
         } catch (error) {
-          console.log('ERR_SAVE_HISTORICAL_DATA', error)
+          console.error('ERR_SAVE_HISTORICAL_DATA', error)
         }
       }
     ], cb)
@@ -123,7 +124,7 @@ class WrkMempoolRack extends TetherWrkBase {
     const hashrateData = await this._fetchWithDelay(
       api.getHashrate,
       api,
-      '2y'
+      '3m'
     )
     if (!hashrateData?.hashrates) return
     for (const hashrateObj of hashrateData.hashrates) {
@@ -139,14 +140,16 @@ class WrkMempoolRack extends TetherWrkBase {
     try {
       try {
         hashratesResponse = await this._getDbData(`${STAT_HASHRATE_HISTORY}-${MEMPOOL_TAG}`, {
-          start: getUTCMidnightTwoYearsAgo(),
+          start: HISTORICAL_DATA_START_TS,
           end: Date.now(),
           key: STAT_HASHRATE_HISTORY,
           tag: MEMPOOL_TAG
         })
       } catch (_) {}
 
-      if (hashratesResponse.length < 726) {
+      const timestamps = getUTCMidnightTimestampsSince(HISTORICAL_DATA_START_TS)
+
+      if (hashratesResponse.length < timestamps.length - 1) {
         await this._fetchAndSaveHistoricalHashrates()
       } else {
         const api = this.mempoolApi
@@ -162,7 +165,7 @@ class WrkMempoolRack extends TetherWrkBase {
         await this._saveHistoricalHashrate(latestHashrateObj)
       }
     } catch (error) {
-      console.log('ERR_FETCH_HISTORICAL_BLOCKSIZES', error)
+      console.error('ERR_FETCH_HISTORICAL_BLOCKSIZES', error)
     } finally {
       this.fetchingHistoricalHashrates = false
     }
@@ -193,17 +196,18 @@ class WrkMempoolRack extends TetherWrkBase {
     this.fetchingHistoricalBlocksData = true
 
     try {
-      const timestamps = getUTCMidnightTimestampsLast2Years()
+      const timestamps = getUTCMidnightTimestampsSince(HISTORICAL_DATA_START_TS)
       let blocksResponse = []
 
       try {
         blocksResponse = await this._getDbData(`${STAT_BLOCKSIZES}-${MEMPOOL_TAG}`, {
-          start: getUTCMidnightTwoYearsAgo(),
-          end: Date.now()
+          start: HISTORICAL_DATA_START_TS,
+          end: Date.now(),
+          limit: timestamps.length
         })
       } catch (_) {}
 
-      if (blocksResponse.length < 726) {
+      if (blocksResponse.length < timestamps.length - 1) {
         for (const ts of timestamps) {
           await this._fetchAndSaveHistoricalBlockSize(ts)
         }
@@ -211,7 +215,7 @@ class WrkMempoolRack extends TetherWrkBase {
         await this._fetchAndSaveHistoricalBlockSize(getUTCMidnightToday())
       }
     } catch (error) {
-      console.log('ERR_FETCH_HISTORICAL_BLOCKSIZES', error)
+      console.error('ERR_FETCH_HISTORICAL_BLOCKSIZES', error)
     } finally {
       this.fetchingHistoricalBlocksData = false
     }
@@ -222,17 +226,18 @@ class WrkMempoolRack extends TetherWrkBase {
     this.fetchingHistoricalPricesData = true
 
     try {
-      const timestamps = getUTCMidnightTimestampsLast2Years()
+      const timestamps = getUTCMidnightTimestampsSince(HISTORICAL_DATA_START_TS)
       let pricesResponse = []
 
       try {
         pricesResponse = await this._getDbData(`${STAT_PRICES}-${MEMPOOL_TAG}`, {
-          start: getUTCMidnightTwoYearsAgo(),
-          end: Date.now()
+          start: HISTORICAL_DATA_START_TS,
+          end: Date.now(),
+          limit: timestamps.length
         })
       } catch (_) {}
 
-      if (pricesResponse.length < 726) {
+      if (pricesResponse.length < timestamps.length - 1) {
         for (const ts of timestamps) {
           await this._fetchAndSaveHistoricalPrice(ts)
         }
@@ -240,7 +245,7 @@ class WrkMempoolRack extends TetherWrkBase {
         await this._fetchAndSaveHistoricalPrice(getUTCMidnightToday())
       }
     } catch (error) {
-      console.log('ERR_FETCH_HISTORICAL_PRICES', error)
+      console.error('ERR_FETCH_HISTORICAL_PRICES', error)
     } finally {
       this.fetchingHistoricalPricesData = false
     }
@@ -250,17 +255,17 @@ class WrkMempoolRack extends TetherWrkBase {
     try {
       await this.saveHistoricalPrices()
     } catch (error) {
-      console.log('ERR_SAVE_HISTORICAL_DATA_PRICES', error)
+      console.error('ERR_SAVE_HISTORICAL_DATA_PRICES', error)
     }
     try {
       await this.saveHistoricalBlockSizes()
     } catch (error) {
-      console.log('ERR_SAVE_HISTORICAL_DATA_BLOCKSIZES', error)
+      console.error('ERR_SAVE_HISTORICAL_DATA_BLOCKSIZES', error)
     }
     try {
       await this.saveHistoricalHashrates()
     } catch (error) {
-      console.log('ERR_SAVE_HISTORICAL_DATA_HASHRATES', error)
+      console.error('ERR_SAVE_HISTORICAL_DATA_HASHRATES', error)
     }
   }
 
@@ -303,7 +308,7 @@ class WrkMempoolRack extends TetherWrkBase {
 
   async _fetchWithDelay (fn, obj, args) {
     // fetch api data with delay due to api rate limits
-    await sleep(1000)
+    await sleep(5000)
     try {
       return await fn.call(obj, args)
     } catch (e) {

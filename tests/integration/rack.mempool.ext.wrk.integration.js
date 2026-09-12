@@ -5,8 +5,12 @@ const WrkMempoolRack = require('../../workers/rack.mempool.ext.wrk')
 const {
   STAT_HASHRATE_HISTORY,
   MEMPOOL_TAG,
-  HISTORICAL_HASHRATE_DATA_KEY
+  HISTORICAL_HASHRATE_DATA_KEY,
+  HISTORICAL_DATA_START_TS
 } = require('../../workers/lib/constants')
+const { getUTCMidnightTimestampsSince } = require('../../workers/lib/utils')
+
+const historicalEntryCount = () => getUTCMidnightTimestampsSince(HISTORICAL_DATA_START_TS).length
 
 test('saveHistoricalData runs all historical collectors in order', async (t) => {
   const wrk = Object.create(WrkMempoolRack.prototype)
@@ -48,7 +52,7 @@ test('saveHistoricalHashrates uses hashrate history key and fetches latest bucke
   }
   wrk._getDbData = async (key) => {
     dbKeys.push(key)
-    return (new Array(726)).fill({})
+    return (new Array(historicalEntryCount())).fill({})
   }
   wrk._fetchAndSaveHistoricalHashrates = async () => {}
   wrk._fetchWithDelay = async () => {

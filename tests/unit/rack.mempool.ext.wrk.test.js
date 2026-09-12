@@ -12,8 +12,12 @@ const {
   MEMPOOL_TAG,
   HISTORICAL_PRICES_DATA_KEY,
   HISTORICAL_BLOCKSIZES_DATA_KEY,
-  HISTORICAL_HASHRATE_DATA_KEY
+  HISTORICAL_HASHRATE_DATA_KEY,
+  HISTORICAL_DATA_START_TS
 } = require('../../workers/lib/constants')
+const { getUTCMidnightTimestampsSince } = require('../../workers/lib/utils')
+
+const historicalEntryCount = () => getUTCMidnightTimestampsSince(HISTORICAL_DATA_START_TS).length
 
 test('_saveHistoricalHashrate stores ts in ms and MH/s conversion', async (t) => {
   const wrk = Object.create(WrkMempoolRack.prototype)
@@ -94,7 +98,7 @@ test('getWrkExtData returns projected non-historical data', async (t) => {
   })
 })
 
-test('saveHistoricalHashrates backfills when db has less than 726 entries', async (t) => {
+test('saveHistoricalHashrates backfills when db has fewer than historical entries', async (t) => {
   const wrk = Object.create(WrkMempoolRack.prototype)
   let fetchAndSaveCalls = 0
   let getHashrateCalls = 0
@@ -103,7 +107,7 @@ test('saveHistoricalHashrates backfills when db has less than 726 entries', asyn
   wrk.mempoolApi = {
     getHashrate: async () => ({})
   }
-  wrk._getDbData = async () => (new Array(725)).fill({})
+  wrk._getDbData = async () => (new Array(Math.max(historicalEntryCount() - 2, 0))).fill({})
   wrk._fetchAndSaveHistoricalHashrates = async () => { fetchAndSaveCalls++ }
   wrk._fetchWithDelay = async () => {
     getHashrateCalls++
@@ -118,7 +122,7 @@ test('saveHistoricalHashrates backfills when db has less than 726 entries', asyn
   t.is(wrk.fetchingHistoricalHashrates, false)
 })
 
-test('saveHistoricalHashrates stores only latest point when db has 726+ entries', async (t) => {
+test('saveHistoricalHashrates stores only latest point when db is already seeded', async (t) => {
   const wrk = Object.create(WrkMempoolRack.prototype)
   let fetchAndSaveCalls = 0
   let fetchWithDelayCalls = 0
@@ -128,7 +132,7 @@ test('saveHistoricalHashrates stores only latest point when db has 726+ entries'
   wrk.mempoolApi = {
     getHashrate: async () => ({})
   }
-  wrk._getDbData = async () => (new Array(726)).fill({})
+  wrk._getDbData = async () => (new Array(historicalEntryCount())).fill({})
   wrk._fetchAndSaveHistoricalHashrates = async () => { fetchAndSaveCalls++ }
   wrk._fetchWithDelay = async (fn, obj, range) => {
     fetchWithDelayCalls++
@@ -408,7 +412,7 @@ test('saveHistoricalPrices fetches only latest when db already seeded', async (t
   const wrk = Object.create(WrkMempoolRack.prototype)
   const calls = []
   wrk.fetchingHistoricalPricesData = false
-  wrk._getDbData = async () => (new Array(726)).fill({})
+  wrk._getDbData = async () => (new Array(historicalEntryCount())).fill({})
   wrk._fetchAndSaveHistoricalPrice = async (ts) => { calls.push(ts) }
 
   await wrk.saveHistoricalPrices()
@@ -421,7 +425,7 @@ test('saveHistoricalBlockSizes fetches only latest when db already seeded', asyn
   const wrk = Object.create(WrkMempoolRack.prototype)
   const calls = []
   wrk.fetchingHistoricalBlocksData = false
-  wrk._getDbData = async () => (new Array(726)).fill({})
+  wrk._getDbData = async () => (new Array(historicalEntryCount())).fill({})
   wrk._fetchAndSaveHistoricalBlockSize = async (ts) => { calls.push(ts) }
 
   await wrk.saveHistoricalBlockSizes()

@@ -4,6 +4,7 @@ module.exports = {
   BTC_SATS: 100000000, // satoshis in 1 btc
   MS_24_HOURS: 24 * 60 * 60 * 1000,
   MS_180_DAYS: 180 * 24 * 60 * 60 * 1000,
+  HISTORICAL_DATA_START_TS: Date.UTC(2026, 7, 10), // 2026-08-10 UTC midnight
   REWARD_AVG_TIMES: {
     '24h': 24 * 60 * 60 * 1000,
     '3d': 3 * 24 * 60 * 60 * 1000,
