@@ -7,6 +7,7 @@ const { setTimeout: sleep } = require('timers/promises')
 const {
   BTC_SATS, REWARD_AVG_TIMES, MS_24_HOURS,
   STAT_PRICES,
+  STAT_PRICES_5M,
   MEMPOOL_TAG,
   HISTORICAL_PRICES_DATA_KEY,
   STAT_BLOCKSIZES,
@@ -14,6 +15,8 @@ const {
   STAT_HASHRATE_HISTORY,
   HISTORICAL_HASHRATE_DATA_KEY,
   HISTORICAL_DATA_START_TS,
+  PRICE_AT_TIMESTAMPS_DATA_KEY,
+  PRICE_SAMPLE_INTERVAL_MS,
   ADDRESS_TXS_PAGE_SIZE,
   ADDRESS_TXS_MAX_PAGES,
   POOL_REBATES_DATA_KEY,
@@ -27,7 +30,7 @@ const {
   REBATES_SYNC_CRON_DEFAULT
 } = require('./lib/constants')
 const { extractRebates, parseDailyCron, lastCronFire } = require('./lib/rebatesSync')
-const { getUTCMidnightTimestampsSince, getUTCMidnightToday } = require('./lib/utils')
+const { getUTCMidnightTimestampsSince, getUTCMidnightToday, priceBucket } = require('./lib/utils')
 const utilsStore = require('@tetherto/hp-svc-facs-store/utils')
 const gLibUtilBase = require('@bitfinex/lib-js-util-base')
 const mingo = require('mingo')
@@ -90,6 +93,12 @@ class WrkMempoolRack extends TetherWrkBase {
         this.mempoolDb = await this.store_s1.getBee({ name: 'mempool' }, { keyEncoding: 'binary' })
         await this.mempoolDb.ready()
 
+        // Held open for the worker's lifetime: the sampler, the rebates sync
+        // and the RPC read path all touch this store, and the _getBee/close-
+        // per-call pattern used by _saveToDbKey would let one close the bee
+        // under the other.
+        this.prices5mDb = await this._getBee(`${STAT_PRICES_5M}-${MEMPOOL_TAG}`)
+
         const dbData = await this._readFromDb()
         if (dbData) this.mempoolData = dbData
 
@@ -99,6 +108,11 @@ class WrkMempoolRack extends TetherWrkBase {
           'mempool-data-fetch',
           this.fetchMempoolData.bind(this),
           this.conf.mempool.dataFetchIntervalMs || 1800000
+        )
+        this.interval_mempool.add(
+          'mempool-price-sample',
+          this.samplePrice.bind(this),
+          this.conf.mempool.priceSampleIntervalMs || PRICE_SAMPLE_INTERVAL_MS
         )
         this.interval_mempool.add(
           'mempool-historical-data-fetch',
@@ -130,8 +144,82 @@ class WrkMempoolRack extends TetherWrkBase {
       { currency: 'USD', timestamp: ts / 1000 }
     )
     if (price?.prices?.[0]?.USD) {
-      await this._saveToDbKey(statKey, ts, { ts, priceUSD: price.prices[0].USD })
+      const priceUSD = price.prices[0].USD
+      await this._saveToDbKey(statKey, ts, { ts, priceUSD })
+      // UTC midnight is always an exact 5m boundary, so the daily series seeds
+      // the bucket store for free - payouts dated at midnight (f2pool mining
+      // dates) then resolve without a backfill.
+      await this._savePriceBucket(priceBucket(ts), priceUSD)
     }
+  }
+
+  async _savePriceBucket (bucketTs, priceUSD) {
+    await this.prices5mDb.put(
+      utilsStore.convIntToBin(bucketTs),
+      Buffer.from(JSON.stringify({ ts: bucketTs, priceUSD }))
+    )
+  }
+
+  async _getPriceBucket (bucketTs) {
+    const entry = await this.prices5mDb.get(utilsStore.convIntToBin(bucketTs))
+    if (!entry) return null
+    return JSON.parse(entry.value.toString())
+  }
+
+  async samplePrice () {
+    if (this.samplingPrice) return
+    this.samplingPrice = true
+
+    try {
+      const api = this.mempoolApi
+      const prices = await this._fetchWithDelay(api.getPrices, api)
+      if (!prices?.USD) return
+
+      // Bucketed at response time rather than when the interval fired: the call
+      // can sit behind other upstream work, and the price belongs to the moment
+      // it was actually read.
+      await this._savePriceBucket(priceBucket(Date.now()), prices.USD)
+    } catch (error) {
+      console.error('ERR_SAMPLE_PRICE', error)
+    } finally {
+      this.samplingPrice = false
+    }
+  }
+
+  // Cache reads only - never fetches. Finance requests call this through an RPC
+  // with a 15s timeout while every upstream call costs at least 5s, so fetching
+  // here would time out the whole request and lose the buckets that did
+  // resolve. Buckets with no stored price come back in `missing` so the caller
+  // knows it fell back (the server-side backfill script clears them).
+  async getPricesAtTimestamps ({ timestamps }) {
+    const prices = {}
+    const missing = []
+
+    if (!Array.isArray(timestamps)) return { prices, missing }
+
+    const buckets = [...new Set(
+      timestamps.filter(Number.isFinite).map((ts) => priceBucket(ts))
+    )]
+
+    for (const bucketTs of buckets) {
+      // convIntToBin writes a 6-byte unsigned int, so a bucket outside
+      // [0, 2^48) would throw and poison the whole batch - one garbage
+      // timestamp must not take down every bucket that did resolve.
+      if (!this._isValidBeeTs(bucketTs)) {
+        missing.push(bucketTs)
+        continue
+      }
+
+      const entry = await this._getPriceBucket(bucketTs)
+      if (entry?.priceUSD) prices[bucketTs] = entry.priceUSD
+      else missing.push(bucketTs)
+    }
+
+    return { prices, missing }
+  }
+
+  _isValidBeeTs (ts) {
+    return Number.isInteger(ts) && ts >= 0 && ts < 2 ** 48
   }
 
   async _saveHistoricalHashrate (hashrateObj) {
@@ -333,15 +421,28 @@ class WrkMempoolRack extends TetherWrkBase {
   }
 
   async _fetchWithDelay (fn, obj, args) {
-    // fetch api data with delay due to api rate limits
-    await sleep(5000)
-    try {
-      return await fn.call(obj, args)
-    } catch (e) {
-      console.error(new Date().toISOString(), e)
-    }
+    // fetch api data with delay due to api rate limits.
+    // Chained so the delay is a real gap between upstream calls rather than a
+    // per-caller sleep: the price sampler runs on its own interval and would
+    // otherwise fire alongside the polling cycles, both waking after the same
+    // 5s and hitting the API together.
+    const previous = this._apiChain || Promise.resolve()
+    let release
+    this._apiChain = new Promise((resolve) => { release = resolve })
 
-    return null
+    try {
+      await previous
+      await sleep(5000)
+      try {
+        return await fn.call(obj, args)
+      } catch (e) {
+        console.error(new Date().toISOString(), e)
+      }
+
+      return null
+    } finally {
+      release()
+    }
   }
 
   async _saveToDb (data) {
@@ -568,7 +669,12 @@ class WrkMempoolRack extends TetherWrkBase {
       const txs = await this._getAddressTxs({ address, sinceTs })
       for (const rebate of extractRebates(txs, address)) {
         if (known.has(rebate.txid) || tombstones.has(rebate.txid)) continue
-        await this._putRebatesKeyedRow(POOL_REBATES_BEE, rebate.txid, rebate)
+        const priceUSD = await this._getReceiptPriceUSD(rebate.ts)
+        await this._putRebatesKeyedRow(
+          POOL_REBATES_BEE,
+          rebate.txid,
+          priceUSD ? { ...rebate, priceUSD } : rebate
+        )
         known.add(rebate.txid)
         added++
       }
@@ -576,6 +682,32 @@ class WrkMempoolRack extends TetherWrkBase {
 
     await this._setRebatesSyncState({ lastSyncedTs: now, lastRunTs: now })
     return { added, firstRun: false }
+  }
+
+  // The USD value of a rebate at the moment it was received. The daily sync
+  // runs within a day of receipt, so the local 5m store normally has the
+  // bucket already; a rebate from further back (first run after an outage)
+  // costs one historical lookup, whose result also lands in the bucket store.
+  // A rebate that still cannot be priced is stored without a price - the
+  // finance read path falls back to the daily price for it - and must never
+  // fail the sync over it.
+  async _getReceiptPriceUSD (ts) {
+    const bucketTs = priceBucket(ts)
+    const bucket = await this._getPriceBucket(bucketTs)
+    if (bucket?.priceUSD) return bucket.priceUSD
+
+    try {
+      await this._rateLimitDelay()
+      const res = await this.mempoolApi.getHistoricalPrices({ currency: 'USD', timestamp: Math.floor(ts / 1000) })
+      const priceUSD = res?.prices?.[0]?.USD
+      if (!priceUSD) return undefined
+
+      await this._savePriceBucket(bucketTs, priceUSD)
+      return priceUSD
+    } catch (err) {
+      console.error(new Date().toISOString(), 'ERR_REBATE_RECEIPT_PRICE', err.message)
+      return undefined
+    }
   }
 
   async _getPoolRebates ({ start, end, query, fields, sort, offset, limit }) {
@@ -612,13 +744,24 @@ class WrkMempoolRack extends TetherWrkBase {
     if (key === POOL_REBATES_UPDATE_KEY) {
       const { txid, ts, amountBTC, sender, receiver } = value || {}
       if (!txid) throw new Error('ERR_TXID_REQUIRED')
-      if (!Number.isInteger(ts) || ts <= 0) throw new Error('ERR_INVALID_TS')
+      // Upper bound keeps the re-price bucket lookup inside convIntToBin's
+      // 6-byte range; anything past it is garbage input, not a timestamp.
+      if (!Number.isInteger(ts) || ts <= 0 || !this._isValidBeeTs(ts)) throw new Error('ERR_INVALID_TS')
       if (!Number.isFinite(amountBTC) || amountBTC <= 0) throw new Error('ERR_INVALID_AMOUNT')
 
       const existing = await this._getRebatesKeyedRow(POOL_REBATES_BEE, txid)
       if (!existing) throw new Error('ERR_REBATE_NOT_FOUND')
 
-      await this._putRebatesKeyedRow(POOL_REBATES_BEE, txid, { ...existing, ts, amountBTC, sender, receiver })
+      const next = { ...existing, ts, amountBTC, sender, receiver }
+      if (ts !== existing.ts) {
+        // The stored price belongs to the old moment. Re-derive from the local
+        // bucket store only - this serves an RPC, so no upstream call budget;
+        // an unknown bucket leaves the row unpriced and the read path falls
+        // back to the daily price rather than keeping a wrong one.
+        const bucket = await this._getPriceBucket(priceBucket(ts))
+        next.priceUSD = bucket?.priceUSD || undefined
+      }
+      await this._putRebatesKeyedRow(POOL_REBATES_BEE, txid, next)
       return true
     }
 
@@ -628,6 +771,10 @@ class WrkMempoolRack extends TetherWrkBase {
   async getWrkExtData (args) {
     if (args.query?.key === POOL_REBATES_DATA_KEY) {
       return await this._getPoolRebates(args.query)
+    }
+
+    if (args.query?.key === PRICE_AT_TIMESTAMPS_DATA_KEY) {
+      return await this.getPricesAtTimestamps(args.query)
     }
 
     if ([HISTORICAL_PRICES_DATA_KEY, HISTORICAL_BLOCKSIZES_DATA_KEY, HISTORICAL_HASHRATE_DATA_KEY].includes(args.query?.key)) {

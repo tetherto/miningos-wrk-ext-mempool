@@ -1,8 +1,10 @@
 'use strict'
 
 const test = require('brittle')
+const utilsStore = require('@tetherto/hp-svc-facs-store/utils')
 const WrkMempoolRack = require('../../workers/rack.mempool.ext.wrk')
 const { extractRebates, parseDailyCron, lastCronFire } = require('../../workers/lib/rebatesSync')
+const { priceBucket } = require('../../workers/lib/utils')
 const {
   POOL_REBATES_BEE,
   POOL_REBATES_DELETED_BEE,
@@ -119,10 +121,33 @@ test('lastCronFire returns the most recent UTC fire time', (t) => {
   t.is(lastCronFire(beforeFire, cron), Date.UTC(2026, 8, 11, 4, 0))
 })
 
-const makeWrk = ({ addresses = [ADDRESS], syncCron, txsByAddress = {} } = {}) => {
+const makeWrk = ({ addresses = [ADDRESS], syncCron, txsByAddress = {}, bucketPrices = {}, historicalPriceUSD = null } = {}) => {
   const wrk = Object.create(WrkMempoolRack.prototype)
   const stores = new Map()
   wrk.conf = { mempool: { rebates: { addresses, ...(syncCron ? { syncCron } : {}) } } }
+
+  // Stand-ins for the 5m price store and the historical price fallback the
+  // sync prices new rebates with.
+  const prices5m = new Map(Object.entries(bucketPrices).map(([ts, priceUSD]) =>
+    [Number(ts), JSON.stringify({ ts: Number(ts), priceUSD })]))
+  wrk.prices5mDb = {
+    get: async (key) => {
+      const val = prices5m.get(utilsStore.convFromBin(key, 'number'))
+      return val ? { value: Buffer.from(val) } : null
+    },
+    put: async (key, value) => { prices5m.set(utilsStore.convFromBin(key, 'number'), value.toString()) }
+  }
+  wrk._prices5m = prices5m
+  wrk._rateLimitDelay = async () => {}
+  wrk._historicalPriceCalls = []
+  wrk.mempoolApi = {
+    getHistoricalPrices: async (args) => {
+      wrk._historicalPriceCalls.push(args)
+      if (historicalPriceUSD instanceof Error) throw historicalPriceUSD
+      return historicalPriceUSD ? { prices: [{ USD: historicalPriceUSD }] } : {}
+    }
+  }
+
   wrk._getBee = async (name) => {
     if (!stores.has(name)) stores.set(name, new Map())
     const rows = stores.get(name)
@@ -344,4 +369,124 @@ test('setWrkExtData update validates its input and target', async (t) => {
     /ERR_INVALID_AMOUNT/
   )
   await t.exception(() => wrk.setWrkExtData({ key: 'nope' }), /ERR_KEY_INVALID/)
+})
+
+// --- receipt pricing --------------------------------------------------------
+
+const BLOCK_TIME = 1700000000 // seconds
+const REBATE_TS = BLOCK_TIME * 1000
+
+const incomingTx = () => tx({
+  txid: TXID_A,
+  blockTime: BLOCK_TIME,
+  vin: [inputFrom('bc1qsender')],
+  vout: [outputTo(ADDRESS, 50000000)]
+})
+
+test('runRebatesSync stamps the receipt price from the local 5m store', async (t) => {
+  const wrk = makeWrk({
+    txsByAddress: { [ADDRESS]: [incomingTx()] },
+    bucketPrices: { [priceBucket(REBATE_TS)]: 64000 }
+  })
+  await wrk._setRebatesSyncState({ lastSyncedTs: 1, lastRunTs: 0 })
+
+  await wrk.runRebatesSync({})
+
+  const [row] = await storedRebates(wrk)
+  t.is(row.priceUSD, 64000)
+  t.alike(wrk._historicalPriceCalls, [], 'a cached bucket costs no upstream call')
+})
+
+test('runRebatesSync falls back to a historical lookup and caches the bucket', async (t) => {
+  const wrk = makeWrk({
+    txsByAddress: { [ADDRESS]: [incomingTx()] },
+    historicalPriceUSD: 42000
+  })
+  await wrk._setRebatesSyncState({ lastSyncedTs: 1, lastRunTs: 0 })
+
+  await wrk.runRebatesSync({})
+
+  const [row] = await storedRebates(wrk)
+  t.is(row.priceUSD, 42000)
+  t.alike(wrk._historicalPriceCalls, [{ currency: 'USD', timestamp: BLOCK_TIME }])
+  t.ok(wrk._prices5m.has(priceBucket(REBATE_TS)), 'the looked-up price also lands in the bucket store')
+})
+
+test('runRebatesSync stores the rebate unpriced when no price source answers', async (t) => {
+  const wrk = makeWrk({ txsByAddress: { [ADDRESS]: [incomingTx()] } })
+  await wrk._setRebatesSyncState({ lastSyncedTs: 1, lastRunTs: 0 })
+
+  const out = await wrk.runRebatesSync({})
+
+  t.is(out.added, 1, 'a missing price never fails the sync')
+  const [row] = await storedRebates(wrk)
+  t.is(row.priceUSD, undefined, 'the row is honestly unpriced, not zero')
+})
+
+test('runRebatesSync survives a historical price lookup error', async (t) => {
+  const wrk = makeWrk({
+    txsByAddress: { [ADDRESS]: [incomingTx()] },
+    historicalPriceUSD: new Error('ERR_NET')
+  })
+  await wrk._setRebatesSyncState({ lastSyncedTs: 1, lastRunTs: 0 })
+
+  const out = await wrk.runRebatesSync({})
+
+  t.is(out.added, 1)
+  t.is((await storedRebates(wrk))[0].priceUSD, undefined)
+})
+
+test('setWrkExtData update re-prices the row when its timestamp changes', async (t) => {
+  const newTs = REBATE_TS + 60 * 60 * 1000
+  const wrk = makeWrk({ bucketPrices: { [priceBucket(newTs)]: 50000 } })
+  await wrk._putRebatesKeyedRow(POOL_REBATES_BEE, TXID_A, {
+    txid: TXID_A, ts: REBATE_TS, amountBTC: 1, source: 'auto', priceUSD: 64000
+  })
+
+  await wrk.setWrkExtData({
+    key: POOL_REBATES_UPDATE_KEY,
+    value: { txid: TXID_A, ts: newTs, amountBTC: 1 }
+  })
+
+  t.is((await storedRebates(wrk))[0].priceUSD, 50000, 'the price follows the moment, not the row')
+})
+
+test('setWrkExtData update drops a price it cannot re-derive for a new timestamp', async (t) => {
+  const wrk = makeWrk()
+  await wrk._putRebatesKeyedRow(POOL_REBATES_BEE, TXID_A, {
+    txid: TXID_A, ts: REBATE_TS, amountBTC: 1, source: 'auto', priceUSD: 64000
+  })
+
+  await wrk.setWrkExtData({
+    key: POOL_REBATES_UPDATE_KEY,
+    value: { txid: TXID_A, ts: REBATE_TS + 1000, amountBTC: 1 }
+  })
+
+  t.is((await storedRebates(wrk))[0].priceUSD, undefined, 'a wrong price is worse than no price')
+})
+
+test('setWrkExtData update keeps the stored price when the timestamp is unchanged', async (t) => {
+  const wrk = makeWrk()
+  await wrk._putRebatesKeyedRow(POOL_REBATES_BEE, TXID_A, {
+    txid: TXID_A, ts: REBATE_TS, amountBTC: 1, source: 'auto', priceUSD: 64000
+  })
+
+  await wrk.setWrkExtData({
+    key: POOL_REBATES_UPDATE_KEY,
+    value: { txid: TXID_A, ts: REBATE_TS, amountBTC: 2 }
+  })
+
+  const [row] = await storedRebates(wrk)
+  t.is(row.amountBTC, 2)
+  t.is(row.priceUSD, 64000, 'an amount edit does not lose the receipt price')
+})
+
+test('setWrkExtData update rejects a timestamp past the store key range', async (t) => {
+  const wrk = makeWrk()
+  await wrk._putRebatesKeyedRow(POOL_REBATES_BEE, TXID_A, { txid: TXID_A, ts: 1000, amountBTC: 1 })
+
+  await t.exception(
+    () => wrk.setWrkExtData({ key: POOL_REBATES_UPDATE_KEY, value: { txid: TXID_A, ts: 2 ** 48, amountBTC: 1 } }),
+    /ERR_INVALID_TS/
+  )
 })

@@ -2,6 +2,7 @@
     "baseUrl": "https://mempool.bitcoin-21.org/api",
     "dataFetchIntervalMs": 1800000,
     "historicalDataFetchIntervalMs": 43200000,
+    "priceSampleIntervalMs": 300000,
     "rebates": {
         "addresses": [],
         "syncCron": "0 0 * * *"
