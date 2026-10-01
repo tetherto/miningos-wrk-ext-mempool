@@ -13,9 +13,12 @@ const {
   HISTORICAL_PRICES_DATA_KEY,
   HISTORICAL_BLOCKSIZES_DATA_KEY,
   HISTORICAL_HASHRATE_DATA_KEY,
-  HISTORICAL_DATA_START_TS
+  HISTORICAL_DATA_START_TS,
+  PRICE_AT_TIMESTAMPS_DATA_KEY,
+  PRICE_BUCKET_MS
 } = require('../../workers/lib/constants')
-const { getUTCMidnightTimestampsSince } = require('../../workers/lib/utils')
+const { getUTCMidnightTimestampsSince, priceBucket } = require('../../workers/lib/utils')
+const utilsStore = require('@tetherto/hp-svc-facs-store/utils')
 
 const historicalEntryCount = () => getUTCMidnightTimestampsSince(HISTORICAL_DATA_START_TS).length
 
@@ -357,15 +360,18 @@ test('fetchMempoolData returns immediately when already fetching', async (t) => 
 test('_fetchAndSaveHistoricalPrice saves only when api provides USD', async (t) => {
   const wrk = Object.create(WrkMempoolRack.prototype)
   const saved = []
+  const buckets = []
   wrk.mempoolApi = { getHistoricalPrices: async () => ({}) }
   wrk._fetchWithDelay = async () => ({ prices: [{ USD: 123 }] })
   wrk._saveToDbKey = async (key, ts, data) => { saved.push({ key, ts, data }) }
+  wrk._savePriceBucket = async (bucketTs, priceUSD) => { buckets.push({ bucketTs, priceUSD }) }
 
   await wrk._fetchAndSaveHistoricalPrice(2000)
 
   t.is(saved.length, 1)
   t.is(saved[0].ts, 2000)
   t.is(saved[0].data.priceUSD, 123)
+  t.alike(buckets, [{ bucketTs: 0, priceUSD: 123 }], 'daily price also lands in the 5m store')
 })
 
 test('_fetchAndSaveHistoricalHashrates saves each returned point', async (t) => {
@@ -480,4 +486,151 @@ test('_readFromDb returns null when no mempool key', async (t) => {
   wrk.mempoolDb = { get: async () => null }
   const out = await wrk._readFromDb()
   t.is(out, null)
+})
+
+// --- 5-minute price buckets -------------------------------------------------
+
+// Minimal stand-in for the long-lived 5m bee handle.
+const fakeBee = (seed = {}) => {
+  const rows = new Map(Object.entries(seed).map(([ts, v]) => [ts, JSON.stringify(v)]))
+  return {
+    rows,
+    async get (key) {
+      const val = rows.get(String(utilsStore.convFromBin(key, 'number')))
+      return val ? { value: Buffer.from(val) } : null
+    },
+    async put (key, value) {
+      rows.set(String(utilsStore.convFromBin(key, 'number')), value.toString())
+    }
+  }
+}
+
+test('samplePrice stores the current price in the bucket it was read in', async (t) => {
+  const wrk = Object.create(WrkMempoolRack.prototype)
+  const saved = []
+  wrk.mempoolApi = { getPrices: async () => ({}) }
+  wrk._fetchWithDelay = async () => ({ USD: 64000 })
+  wrk._savePriceBucket = async (bucketTs, priceUSD) => { saved.push({ bucketTs, priceUSD }) }
+
+  await wrk.samplePrice()
+
+  t.is(saved.length, 1)
+  t.is(saved[0].priceUSD, 64000)
+  t.is(saved[0].bucketTs % PRICE_BUCKET_MS, 0, 'always written on a bucket boundary')
+  t.ok(saved[0].bucketTs <= Date.now(), 'never a future bucket')
+})
+
+test('samplePrice writes nothing when the api returns no USD price', async (t) => {
+  const wrk = Object.create(WrkMempoolRack.prototype)
+  let saves = 0
+  wrk.mempoolApi = { getPrices: async () => ({}) }
+  wrk._fetchWithDelay = async () => null
+  wrk._savePriceBucket = async () => { saves++ }
+
+  await wrk.samplePrice()
+
+  t.is(saves, 0)
+  t.absent(wrk.samplingPrice, 'flag released for the next interval')
+})
+
+test('samplePrice skips while a previous sample is still running', async (t) => {
+  const wrk = Object.create(WrkMempoolRack.prototype)
+  let calls = 0
+  wrk.samplingPrice = true
+  wrk.mempoolApi = { getPrices: async () => ({}) }
+  wrk._fetchWithDelay = async () => { calls++; return { USD: 1 } }
+  wrk._savePriceBucket = async () => {}
+
+  await wrk.samplePrice()
+
+  t.is(calls, 0)
+})
+
+test('getPricesAtTimestamps reads cache only and never calls upstream', async (t) => {
+  const wrk = Object.create(WrkMempoolRack.prototype)
+  const bucket = priceBucket(Date.UTC(2026, 4, 28, 16, 46, 30))
+  wrk.prices5mDb = fakeBee({ [bucket]: { ts: bucket, priceUSD: 64000 } })
+  wrk.mempoolApi = {
+    getHistoricalPrices: async () => t.fail('must not fetch: the RPC budget is 15s and a fetch costs 5s'),
+    getPrices: async () => t.fail('must not fetch')
+  }
+
+  const res = await wrk.getPricesAtTimestamps({
+    timestamps: [Date.UTC(2026, 4, 28, 16, 46, 30), Date.UTC(2026, 4, 28, 23, 0, 0)]
+  })
+
+  t.alike(res.prices, { [bucket]: 64000 })
+  t.alike(res.missing, [priceBucket(Date.UTC(2026, 4, 28, 23, 0, 0))])
+})
+
+test('getPricesAtTimestamps collapses timestamps sharing a bucket', async (t) => {
+  const wrk = Object.create(WrkMempoolRack.prototype)
+  const bucket = priceBucket(Date.UTC(2026, 4, 28, 16, 45))
+  wrk.prices5mDb = fakeBee({ [bucket]: { ts: bucket, priceUSD: 100 } })
+
+  const res = await wrk.getPricesAtTimestamps({
+    timestamps: [
+      Date.UTC(2026, 4, 28, 16, 45, 1),
+      Date.UTC(2026, 4, 28, 16, 47),
+      Date.UTC(2026, 4, 28, 16, 49, 59)
+    ]
+  })
+
+  t.alike(res.prices, { [bucket]: 100 })
+  t.alike(res.missing, [], 'three payouts minutes apart cost one lookup')
+})
+
+test('getPricesAtTimestamps reports a backfill failure marker as missing', async (t) => {
+  const wrk = Object.create(WrkMempoolRack.prototype)
+  const bucket = priceBucket(Date.UTC(2026, 4, 28, 16, 45))
+  // What the backfill script leaves behind for a timestamp upstream cannot answer.
+  wrk.prices5mDb = fakeBee({ [bucket]: { ts: bucket, priceUSD: null, attempts: 4 } })
+
+  const res = await wrk.getPricesAtTimestamps({ timestamps: [bucket] })
+
+  t.alike(res.prices, {})
+  t.alike(res.missing, [bucket], 'a priceless bucket is honestly reported, not treated as zero')
+})
+
+test('getPricesAtTimestamps tolerates a missing or malformed timestamp list', async (t) => {
+  const wrk = Object.create(WrkMempoolRack.prototype)
+  wrk.prices5mDb = fakeBee()
+
+  t.alike(await wrk.getPricesAtTimestamps({}), { prices: {}, missing: [] })
+  t.alike(await wrk.getPricesAtTimestamps({ timestamps: [null, 'x', undefined] }), { prices: {}, missing: [] })
+})
+
+test('getWrkExtData routes price-bucket lookups to the cache reader', async (t) => {
+  const wrk = Object.create(WrkMempoolRack.prototype)
+  let captured = null
+  wrk.getPricesAtTimestamps = async (query) => { captured = query; return { prices: {}, missing: [] } }
+  wrk._getDbData = async () => t.fail('must not hit the historical range reader')
+
+  const query = { key: PRICE_AT_TIMESTAMPS_DATA_KEY, timestamps: [1, 2] }
+  const res = await wrk.getWrkExtData({ query })
+
+  t.alike(captured, query)
+  t.alike(res, { prices: {}, missing: [] })
+})
+
+test('_fetchWithDelay serializes concurrent callers instead of releasing them together', async (t) => {
+  const wrk = Object.create(WrkMempoolRack.prototype)
+  let inFlight = 0
+  let maxInFlight = 0
+  const order = []
+
+  const call = (tag) => wrk._fetchWithDelay(async () => {
+    inFlight++
+    maxInFlight = Math.max(maxInFlight, inFlight)
+    order.push(tag)
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    inFlight--
+    return tag
+  }, null)
+
+  const res = await Promise.all([call('a'), call('b'), call('c')])
+
+  t.alike(res, ['a', 'b', 'c'])
+  t.is(maxInFlight, 1, 'the sampler and the polling cycles never hit the api together')
+  t.alike(order, ['a', 'b', 'c'], 'calls keep their submission order')
 })
