@@ -7,15 +7,18 @@ const { setTimeout: sleep } = require('timers/promises')
 const {
   BTC_SATS, REWARD_AVG_TIMES, MS_24_HOURS,
   STAT_PRICES,
+  STAT_PRICES_5M,
   MEMPOOL_TAG,
   HISTORICAL_PRICES_DATA_KEY,
   STAT_BLOCKSIZES,
   HISTORICAL_BLOCKSIZES_DATA_KEY,
   STAT_HASHRATE_HISTORY,
   HISTORICAL_HASHRATE_DATA_KEY,
-  HISTORICAL_DATA_START_TS
+  HISTORICAL_DATA_START_TS,
+  PRICE_AT_TIMESTAMPS_DATA_KEY,
+  PRICE_SAMPLE_INTERVAL_MS
 } = require('./lib/constants')
-const { getUTCMidnightTimestampsSince, getUTCMidnightToday } = require('./lib/utils')
+const { getUTCMidnightTimestampsSince, getUTCMidnightToday, priceBucket } = require('./lib/utils')
 const utilsStore = require('@tetherto/hp-svc-facs-store/utils')
 const gLibUtilBase = require('@bitfinex/lib-js-util-base')
 const mingo = require('mingo')
@@ -75,6 +78,11 @@ class WrkMempoolRack extends TetherWrkBase {
         this.mempoolDb = await this.store_s1.getBee({ name: 'mempool' }, { keyEncoding: 'binary' })
         await this.mempoolDb.ready()
 
+        // Held open for the worker's lifetime: the sampler and the RPC read path
+        // both touch this store, and the _getBee/close-per-call pattern used by
+        // _saveToDbKey would let one close the bee under the other.
+        this.prices5mDb = await this._getBee(`${STAT_PRICES_5M}-${MEMPOOL_TAG}`)
+
         const dbData = await this._readFromDb()
         if (dbData) this.mempoolData = dbData
 
@@ -84,6 +92,11 @@ class WrkMempoolRack extends TetherWrkBase {
           'mempool-data-fetch',
           this.fetchMempoolData.bind(this),
           this.conf.mempool.dataFetchIntervalMs || 1800000
+        )
+        this.interval_mempool.add(
+          'mempool-price-sample',
+          this.samplePrice.bind(this),
+          this.conf.mempool.priceSampleIntervalMs || PRICE_SAMPLE_INTERVAL_MS
         )
         this.interval_mempool.add(
           'mempool-historical-data-fetch',
@@ -108,8 +121,66 @@ class WrkMempoolRack extends TetherWrkBase {
       { currency: 'USD', timestamp: ts / 1000 }
     )
     if (price?.prices?.[0]?.USD) {
-      await this._saveToDbKey(statKey, ts, { ts, priceUSD: price.prices[0].USD })
+      const priceUSD = price.prices[0].USD
+      await this._saveToDbKey(statKey, ts, { ts, priceUSD })
+      await this._savePriceBucket(priceBucket(ts), priceUSD)
     }
+  }
+
+  async _savePriceBucket (bucketTs, priceUSD) {
+    await this.prices5mDb.put(
+      utilsStore.convIntToBin(bucketTs),
+      Buffer.from(JSON.stringify({ ts: bucketTs, priceUSD }))
+    )
+  }
+
+  async _getPriceBucket (bucketTs) {
+    const entry = await this.prices5mDb.get(utilsStore.convIntToBin(bucketTs))
+    if (!entry) return null
+    return JSON.parse(entry.value.toString())
+  }
+
+  async samplePrice () {
+    if (this.samplingPrice) return
+    this.samplingPrice = true
+
+    try {
+      const api = this.mempoolApi
+      const prices = await this._fetchWithDelay(api.getPrices, api)
+      if (!prices?.USD) return
+
+      // Bucketed at response time rather than when the interval fired: the call
+      // can sit behind other upstream work, and the price belongs to the moment
+      // it was actually read.
+      await this._savePriceBucket(priceBucket(Date.now()), prices.USD)
+    } catch (error) {
+      console.error('ERR_SAMPLE_PRICE', error)
+    } finally {
+      this.samplingPrice = false
+    }
+  }
+
+  // Cache reads only — never fetches. Finance requests call this through an RPC
+  // with a 15s timeout while every upstream call costs at least 5s, so fetching
+  // here would time out the whole request and lose the buckets that did resolve.
+  // Buckets with no stored price come back in `missing` for the backfill script.
+  async getPricesAtTimestamps ({ timestamps }) {
+    const prices = {}
+    const missing = []
+
+    if (!Array.isArray(timestamps)) return { prices, missing }
+
+    const buckets = [...new Set(
+      timestamps.filter(Number.isFinite).map((ts) => priceBucket(ts))
+    )]
+
+    for (const bucketTs of buckets) {
+      const entry = await this._getPriceBucket(bucketTs)
+      if (entry?.priceUSD) prices[bucketTs] = entry.priceUSD
+      else missing.push(bucketTs)
+    }
+
+    return { prices, missing }
   }
 
   async _saveHistoricalHashrate (hashrateObj) {
@@ -307,15 +378,28 @@ class WrkMempoolRack extends TetherWrkBase {
   }
 
   async _fetchWithDelay (fn, obj, args) {
-    // fetch api data with delay due to api rate limits
-    await sleep(5000)
-    try {
-      return await fn.call(obj, args)
-    } catch (e) {
-      console.error(new Date().toISOString(), e)
-    }
+    // fetch api data with delay due to api rate limits.
+    // Chained so the delay is a real gap between upstream calls rather than a
+    // per-caller sleep: the price sampler runs on its own interval and would
+    // otherwise fire alongside the polling cycles, both waking after the same
+    // 5s and hitting the API together.
+    const previous = this._apiChain || Promise.resolve()
+    let release
+    this._apiChain = new Promise((resolve) => { release = resolve })
 
-    return null
+    try {
+      await previous
+      await sleep(5000)
+      try {
+        return await fn.call(obj, args)
+      } catch (e) {
+        console.error(new Date().toISOString(), e)
+      }
+
+      return null
+    } finally {
+      release()
+    }
   }
 
   async _saveToDb (data) {
@@ -425,6 +509,10 @@ class WrkMempoolRack extends TetherWrkBase {
   }
 
   async getWrkExtData (args) {
+    if (args.query?.key === PRICE_AT_TIMESTAMPS_DATA_KEY) {
+      return await this.getPricesAtTimestamps(args.query)
+    }
+
     if ([HISTORICAL_PRICES_DATA_KEY, HISTORICAL_BLOCKSIZES_DATA_KEY, HISTORICAL_HASHRATE_DATA_KEY].includes(args.query?.key)) {
       const key = `${this._getHistoricalExtDataLogKey(args.query.key)}-${MEMPOOL_TAG}`
       return await this._getDbData(key, args.query)
