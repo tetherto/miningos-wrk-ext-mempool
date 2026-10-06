@@ -49,9 +49,12 @@ class MempoolApi {
     return await this._request(`/v1/block/${hash}`)
   }
 
-  async getAddressTxsChain ({ address, lastSeenTxid }) {
-    const suffix = lastSeenTxid ? `/${lastSeenTxid}` : ''
-    return await this._request(`/address/${address}/txs/chain${suffix}`)
+  // The esplora-style /txs/chain/:txid route is not served by electrum-backed
+  // mempool instances (our self-hosted upstream 404s on it); the after_txid
+  // query form paginates on both backends.
+  async getAddressTxs ({ address, afterTxid }) {
+    const suffix = afterTxid ? `?after_txid=${afterTxid}` : ''
+    return await this._request(`/address/${address}/txs${suffix}`)
   }
 }
 

@@ -17,7 +17,6 @@ const {
   HISTORICAL_DATA_START_TS,
   PRICE_AT_TIMESTAMPS_DATA_KEY,
   PRICE_SAMPLE_INTERVAL_MS,
-  ADDRESS_TXS_PAGE_SIZE,
   ADDRESS_TXS_MAX_PAGES,
   POOL_REBATES_DATA_KEY,
   POOL_REBATES_UPDATE_KEY,
@@ -29,7 +28,7 @@ const {
   REBATES_SYNC_OVERLAP_MS,
   REBATES_SYNC_CRON_DEFAULT
 } = require('./lib/constants')
-const { extractRebates, parseDailyCron, lastCronFire } = require('./lib/rebatesSync')
+const { extractRebates, parseSyncCron, lastCronFire } = require('./lib/rebatesSync')
 const { getUTCMidnightTimestampsSince, getUTCMidnightToday, priceBucket } = require('./lib/utils')
 const utilsStore = require('@tetherto/hp-svc-facs-store/utils')
 const gLibUtilBase = require('@bitfinex/lib-js-util-base')
@@ -560,9 +559,12 @@ class WrkMempoolRack extends TetherWrkBase {
     const txs = []
     let lastSeenTxid
 
+    // Page size depends on the upstream backend (10 on electrum-backed
+    // instances, 25 on esplora), so only an empty batch, the sinceTs cutoff
+    // or the page cap end the walk - never a short page.
     for (let page = 0; page < ADDRESS_TXS_MAX_PAGES; page++) {
       await this._rateLimitDelay()
-      const batch = await this.mempoolApi.getAddressTxsChain({ address, lastSeenTxid })
+      const batch = await this.mempoolApi.getAddressTxs({ address, afterTxid: lastSeenTxid })
       if (!Array.isArray(batch) || !batch.length) break
 
       for (const tx of batch) {
@@ -572,7 +574,7 @@ class WrkMempoolRack extends TetherWrkBase {
       }
 
       lastSeenTxid = batch[batch.length - 1]?.txid
-      if (batch.length < ADDRESS_TXS_PAGE_SIZE) break
+      if (!lastSeenTxid) break
     }
 
     return txs
@@ -625,7 +627,7 @@ class WrkMempoolRack extends TetherWrkBase {
 
     let cron
     try {
-      cron = parseDailyCron(conf.syncCron || REBATES_SYNC_CRON_DEFAULT)
+      cron = parseSyncCron(conf.syncCron || REBATES_SYNC_CRON_DEFAULT)
     } catch (err) {
       console.error(new Date().toISOString(), 'ERR_REBATES_SYNC_CRON', conf.syncCron)
       return

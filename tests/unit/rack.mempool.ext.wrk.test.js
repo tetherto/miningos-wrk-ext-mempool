@@ -494,8 +494,8 @@ const addressTxsWrk = (pages) => {
   const calls = []
   wrk._rateLimitDelay = async () => {}
   wrk.mempoolApi = {
-    getAddressTxsChain: async ({ address, lastSeenTxid }) => {
-      calls.push({ address, lastSeenTxid })
+    getAddressTxs: async ({ address, afterTxid }) => {
+      calls.push({ address, afterTxid })
       return pages[calls.length - 1] ?? []
     }
   }
@@ -507,26 +507,30 @@ test('_getAddressTxs requires an address', async (t) => {
   await t.exception(() => wrk._getAddressTxs({}), /ERR_ADDRESS_REQUIRED/)
 })
 
-test('_getAddressTxs returns confirmed txs from a single short page', async (t) => {
+test('_getAddressTxs pages until the upstream returns an empty batch', async (t) => {
   const { wrk, calls } = addressTxsWrk([
     [addressTx('tx1', 2000), { txid: 'tx2', status: { confirmed: false } }, addressTx('tx3', 1000)]
   ])
 
   const out = await wrk._getAddressTxs({ address: 'bc1qaddr' })
 
-  t.alike(calls, [{ address: 'bc1qaddr', lastSeenTxid: undefined }])
+  t.alike(calls, [
+    { address: 'bc1qaddr', afterTxid: undefined },
+    { address: 'bc1qaddr', afterTxid: 'tx3' }
+  ])
   t.alike(out.map((tx) => tx.txid), ['tx1', 'tx3'])
 })
 
-test('_getAddressTxs paginates full pages via lastSeenTxid', async (t) => {
-  const fullPage = Array.from({ length: 25 }, (_, i) => addressTx(`page1-${i}`, 5000 - i))
-  const { wrk, calls } = addressTxsWrk([fullPage, [addressTx('page2-0', 100)]])
+test('_getAddressTxs paginates short pages via afterTxid rather than page size', async (t) => {
+  const page1 = Array.from({ length: 10 }, (_, i) => addressTx(`page1-${i}`, 5000 - i))
+  const { wrk, calls } = addressTxsWrk([page1, [addressTx('page2-0', 100)]])
 
   const out = await wrk._getAddressTxs({ address: 'bc1qaddr' })
 
-  t.is(calls.length, 2)
-  t.is(calls[1].lastSeenTxid, 'page1-24')
-  t.is(out.length, 26)
+  t.is(calls.length, 3)
+  t.is(calls[1].afterTxid, 'page1-9')
+  t.is(calls[2].afterTxid, 'page2-0')
+  t.is(out.length, 11)
 })
 
 test('_getAddressTxs stops at sinceTs and drops older txs', async (t) => {
@@ -544,7 +548,7 @@ test('_getAddressTxs propagates api errors', async (t) => {
   const wrk = Object.create(WrkMempoolRack.prototype)
   wrk._rateLimitDelay = async () => {}
   wrk.mempoolApi = {
-    getAddressTxsChain: async () => { throw new Error('ERR_HTTP') }
+    getAddressTxs: async () => { throw new Error('ERR_HTTP') }
   }
 
   await t.exception(() => wrk._getAddressTxs({ address: 'bc1qaddr' }), /ERR_HTTP/)

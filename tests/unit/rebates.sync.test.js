@@ -3,7 +3,7 @@
 const test = require('brittle')
 const utilsStore = require('@tetherto/hp-svc-facs-store/utils')
 const WrkMempoolRack = require('../../workers/rack.mempool.ext.wrk')
-const { extractRebates, parseDailyCron, lastCronFire } = require('../../workers/lib/rebatesSync')
+const { extractRebates, parseSyncCron, lastCronFire } = require('../../workers/lib/rebatesSync')
 const { priceBucket } = require('../../workers/lib/utils')
 const {
   POOL_REBATES_BEE,
@@ -103,22 +103,34 @@ test('extractRebates skips unconfirmed, unrelated and repeated txs', (t) => {
   t.alike(rebates.map((r) => r.txid), [TXID_A])
 })
 
-test('parseDailyCron accepts daily schedules and rejects everything else', (t) => {
-  t.alike(parseDailyCron('0 0 * * *'), { minute: 0, hour: 0 })
-  t.alike(parseDailyCron('30 4 * * *'), { minute: 30, hour: 4 })
+test('parseSyncCron accepts minute/hour schedules and rejects everything else', (t) => {
+  t.alike(parseSyncCron('0 0 * * *'), { minute: 0, hour: 0, minuteStep: null })
+  t.alike(parseSyncCron('30 4 * * *'), { minute: 30, hour: 4, minuteStep: null })
+  t.alike(parseSyncCron('15 * * * *'), { minute: 15, hour: '*', minuteStep: null })
+  t.alike(parseSyncCron('*/5 * * * *'), { minute: '*', hour: '*', minuteStep: 5 })
+  t.alike(parseSyncCron('*/5 4 * * *'), { minute: '*', hour: 4, minuteStep: 5 })
+  t.alike(parseSyncCron('* * * * *'), { minute: '*', hour: '*', minuteStep: null })
 
-  for (const bad of ['', '0 4 * *', '0 4 1 * *', '0 4 * 2 *', '0 4 * * 1', '60 4 * * *', '0 24 * * *', '*/5 4 * * *']) {
-    t.exception(() => parseDailyCron(bad), /ERR_INVALID_SYNC_CRON/, `rejects "${bad}"`)
+  for (const bad of ['', '0 4 * *', '0 4 1 * *', '0 4 * 2 *', '0 4 * * 1', '60 4 * * *', '0 24 * * *', '*/0 * * * *', '*/60 * * * *', '5-10 * * * *', '0 */2 * * *']) {
+    t.exception(() => parseSyncCron(bad), /ERR_INVALID_SYNC_CRON/, `rejects "${bad}"`)
   }
 })
 
 test('lastCronFire returns the most recent UTC fire time', (t) => {
-  const cron = parseDailyCron('0 4 * * *')
-  const afterFire = Date.UTC(2026, 8, 12, 10, 0)
-  const beforeFire = Date.UTC(2026, 8, 12, 1, 0)
+  const daily = parseSyncCron('0 4 * * *')
+  t.is(lastCronFire(Date.UTC(2026, 8, 12, 10, 0), daily), Date.UTC(2026, 8, 12, 4, 0))
+  t.is(lastCronFire(Date.UTC(2026, 8, 12, 1, 0), daily), Date.UTC(2026, 8, 11, 4, 0))
 
-  t.is(lastCronFire(afterFire, cron), Date.UTC(2026, 8, 12, 4, 0))
-  t.is(lastCronFire(beforeFire, cron), Date.UTC(2026, 8, 11, 4, 0))
+  const everyFive = parseSyncCron('*/5 * * * *')
+  t.is(lastCronFire(Date.UTC(2026, 8, 12, 10, 7, 30), everyFive), Date.UTC(2026, 8, 12, 10, 5))
+  t.is(lastCronFire(Date.UTC(2026, 8, 12, 10, 5), everyFive), Date.UTC(2026, 8, 12, 10, 5))
+
+  const hourly = parseSyncCron('20 * * * *')
+  t.is(lastCronFire(Date.UTC(2026, 8, 12, 10, 7), hourly), Date.UTC(2026, 8, 12, 9, 20))
+  t.is(lastCronFire(Date.UTC(2026, 8, 12, 10, 40), hourly), Date.UTC(2026, 8, 12, 10, 20))
+
+  const everyMinute = parseSyncCron('* * * * *')
+  t.is(lastCronFire(Date.UTC(2026, 8, 12, 10, 7, 45), everyMinute), Date.UTC(2026, 8, 12, 10, 7))
 })
 
 const makeWrk = ({ addresses = [ADDRESS], syncCron, txsByAddress = {}, bucketPrices = {}, historicalPriceUSD = null } = {}) => {
@@ -230,7 +242,7 @@ test('maybeRunRebatesSync skips when the last cron fire is already covered', asy
 
 test('maybeRunRebatesSync runs when due and records the run on success', async (t) => {
   const wrk = makeWrk()
-  const lastFire = lastCronFire(Date.now(), parseDailyCron('0 0 * * *'))
+  const lastFire = lastCronFire(Date.now(), parseSyncCron('0 0 * * *'))
   await wrk._setRebatesSyncState({ lastSyncedTs: 1, lastRunTs: lastFire - 1 })
 
   await wrk.maybeRunRebatesSync()
@@ -251,12 +263,22 @@ test('maybeRunRebatesSync swallows failures so the next tick retries', async (t)
 })
 
 test('maybeRunRebatesSync refuses to run on an invalid cron', async (t) => {
-  const wrk = makeWrk({ syncCron: '*/5 * * * *' })
+  const wrk = makeWrk({ syncCron: '0 4 1 * *' })
   await wrk._setRebatesSyncState({ lastSyncedTs: 1, lastRunTs: 0 })
 
   await wrk.maybeRunRebatesSync()
 
   t.is(wrk._addressTxsCalls.length, 0)
+})
+
+test('maybeRunRebatesSync runs sub-daily schedules', async (t) => {
+  const wrk = makeWrk({ syncCron: '*/5 * * * *' })
+  await wrk._setRebatesSyncState({ lastSyncedTs: 1, lastRunTs: 0 })
+
+  await wrk.maybeRunRebatesSync()
+
+  t.is(wrk._addressTxsCalls.length, 1)
+  t.ok((await wrk._getRebatesSyncState()).lastRunTs > 0)
 })
 
 test('maybeRunRebatesSync ignores ticks while a run is in flight', async (t) => {
