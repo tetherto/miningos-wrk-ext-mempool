@@ -23,8 +23,8 @@ test('MempoolApi methods call expected endpoints', async (t) => {
   await api.getHistoricalPrices({ currency: 'USD', timestamp: 1 })
   await api.getBlockByTimestamp(123)
   await api.getBlock('abc')
-  await api.getAddressTxsChain({ address: 'bc1qaddr' })
-  await api.getAddressTxsChain({ address: 'bc1qaddr', lastSeenTxid: 'txid1' })
+  await api.getAddressTxs({ address: 'bc1qaddr' })
+  await api.getAddressTxs({ address: 'bc1qaddr', afterTxid: 'txid1' })
 
   t.alike(paths, [
     '/v1/prices',
@@ -37,7 +37,7 @@ test('MempoolApi methods call expected endpoints', async (t) => {
     '/v1/historical-price?currency=USD&timestamp=1',
     '/v1/mining/blocks/timestamp/123',
     '/v1/block/abc',
-    '/address/bc1qaddr/txs/chain',
-    '/address/bc1qaddr/txs/chain/txid1'
+    '/address/bc1qaddr/txs',
+    '/address/bc1qaddr/txs?after_txid=txid1'
   ])
 })

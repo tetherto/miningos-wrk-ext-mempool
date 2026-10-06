@@ -35,35 +35,59 @@ function extractRebates (txs, address) {
   return rebates
 }
 
-const DAY_MS = 24 * 60 * 60 * 1000
-
-// Daily schedules only: "M H * * *", evaluated in UTC. A plain hour/minute in
-// UTC keeps site locations out of config files (a timezone names the site);
-// e.g. "0 4 * * *" runs at a South American site's midnight.
-function parseDailyCron (expr) {
+// Schedules are the minute/hour subset of cron, evaluated in UTC so site
+// locations stay out of config files (a timezone names the site). "0 4 * * *"
+// runs daily at a South American site's midnight; "*/5 * * * *" and
+// "15 * * * *" style sub-daily schedules are for staging, where waiting a day
+// per sync makes testing impractical. Day, month and weekday must stay "*".
+function parseSyncCron (expr) {
   const parts = String(expr ?? '').trim().split(/\s+/)
   if (parts.length !== 5 || parts[2] !== '*' || parts[3] !== '*' || parts[4] !== '*') {
     throw new Error('ERR_INVALID_SYNC_CRON')
   }
 
-  const minute = Number(parts[0])
-  const hour = Number(parts[1])
-  if (!Number.isInteger(minute) || minute < 0 || minute > 59) throw new Error('ERR_INVALID_SYNC_CRON')
-  if (!Number.isInteger(hour) || hour < 0 || hour > 23) throw new Error('ERR_INVALID_SYNC_CRON')
+  const [minutePart, hourPart] = parts
+  const cron = { minute: '*', hour: '*', minuteStep: null }
 
-  return { minute, hour }
+  if (minutePart.startsWith('*/')) {
+    const step = Number(minutePart.slice(2))
+    if (!Number.isInteger(step) || step < 1 || step > 59) throw new Error('ERR_INVALID_SYNC_CRON')
+    cron.minuteStep = step
+  } else if (minutePart !== '*') {
+    const minute = Number(minutePart)
+    if (!Number.isInteger(minute) || minute < 0 || minute > 59) throw new Error('ERR_INVALID_SYNC_CRON')
+    cron.minute = minute
+  }
+
+  if (hourPart !== '*') {
+    const hour = Number(hourPart)
+    if (!Number.isInteger(hour) || hour < 0 || hour > 23) throw new Error('ERR_INVALID_SYNC_CRON')
+    cron.hour = hour
+  }
+
+  return cron
+}
+
+const MINUTE_MS = 60 * 1000
+
+function cronMatches (ts, { minute, hour, minuteStep }) {
+  const date = new Date(ts)
+  if (hour !== '*' && date.getUTCHours() !== hour) return false
+  if (minuteStep) return date.getUTCMinutes() % minuteStep === 0
+  return minute === '*' || date.getUTCMinutes() === minute
 }
 
 // The most recent scheduled fire time at or before `now`; a run is due when
-// the last completed run predates it.
-function lastCronFire (now, { minute, hour }) {
-  const dayStart = now - (now % DAY_MS)
-  const todayFire = dayStart + hour * 60 * 60 * 1000 + minute * 60 * 1000
-  return now >= todayFire ? todayFire : todayFire - DAY_MS
+// the last completed run predates it. Every accepted schedule fires at least
+// once a day, so the scan terminates within 24h of minutes.
+function lastCronFire (now, cron) {
+  let ts = now - (now % MINUTE_MS)
+  while (!cronMatches(ts, cron)) ts -= MINUTE_MS
+  return ts
 }
 
 module.exports = {
   extractRebates,
-  parseDailyCron,
+  parseSyncCron,
   lastCronFire
 }
