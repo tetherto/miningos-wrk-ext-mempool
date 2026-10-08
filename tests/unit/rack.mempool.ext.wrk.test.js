@@ -544,6 +544,25 @@ test('_getAddressTxs stops at sinceTs and drops older txs', async (t) => {
   t.alike(out.map((tx) => tx.txid), ['new'])
 })
 
+test('_getAddressTxs walks every page down to sinceTs, however busy the window', async (t) => {
+  const pages = Array.from({ length: 45 }, (_, p) =>
+    Array.from({ length: 10 }, (_, i) => addressTx(`p${p}-${i}`, 100000 - p * 10 - i)))
+  pages.push([addressTx('too-old', 1)])
+  const { wrk, calls } = addressTxsWrk(pages)
+
+  const out = await wrk._getAddressTxs({ address: 'bc1qaddr', sinceTs: 2000 })
+
+  t.is(calls.length, 46)
+  t.is(out.length, 450)
+})
+
+test('_getAddressTxs fails when the upstream ignores the page cursor', async (t) => {
+  const page = [addressTx('tx1', 2000), addressTx('tx2', 1999)]
+  const { wrk } = addressTxsWrk([page, page, page])
+
+  await t.exception(() => wrk._getAddressTxs({ address: 'bc1qaddr' }), /ERR_ADDRESS_TXS_PAGINATION/)
+})
+
 test('_getAddressTxs propagates api errors', async (t) => {
   const wrk = Object.create(WrkMempoolRack.prototype)
   wrk._rateLimitDelay = async () => {}
