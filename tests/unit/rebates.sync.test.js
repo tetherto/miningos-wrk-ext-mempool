@@ -193,7 +193,22 @@ test('runRebatesSync first run only records the deployment moment', async (t) =>
 
   t.is(out.firstRun, true)
   t.is(wrk._addressTxsCalls.length, 0)
-  t.alike(await wrk._getRebatesSyncState(), { lastSyncedTs: 1234, lastRunTs: 1234 })
+  t.alike(await wrk._getRebatesSyncState(), { startTs: 1234, lastSyncedTs: 1234, lastRunTs: 1234 })
+})
+
+test('runRebatesSync overlap never reaches back past the deployment moment', async (t) => {
+  const HOUR = 60 * 60 * 1000
+  const deployedAt = 100 * HOUR
+  const wrk = makeWrk()
+
+  await wrk.runRebatesSync({ now: deployedAt })
+  await wrk.runRebatesSync({ now: deployedAt + HOUR })
+  await wrk.runRebatesSync({ now: deployedAt + 10 * HOUR })
+  await wrk.runRebatesSync({ now: deployedAt + 20 * HOUR })
+
+  t.is(REBATES_SYNC_OVERLAP_MS, 2 * HOUR)
+  t.alike(wrk._addressTxsCalls.map((c) => c.sinceTs), [deployedAt, deployedAt, deployedAt + 8 * HOUR])
+  t.is((await wrk._getRebatesSyncState()).startTs, deployedAt, 'startTs survives later runs')
 })
 
 test('runRebatesSync ingests per address and skips stored and tombstoned txids', async (t) => {

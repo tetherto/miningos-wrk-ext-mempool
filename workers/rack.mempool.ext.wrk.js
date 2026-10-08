@@ -17,7 +17,6 @@ const {
   HISTORICAL_DATA_START_TS,
   PRICE_AT_TIMESTAMPS_DATA_KEY,
   PRICE_SAMPLE_INTERVAL_MS,
-  ADDRESS_TXS_MAX_PAGES,
   POOL_REBATES_DATA_KEY,
   POOL_REBATES_UPDATE_KEY,
   POOL_REBATES_DELETE_KEY,
@@ -560,9 +559,10 @@ class WrkMempoolRack extends TetherWrkBase {
     let lastSeenTxid
 
     // Page size depends on the upstream backend (10 on electrum-backed
-    // instances, 25 on esplora), so only an empty batch, the sinceTs cutoff
-    // or the page cap end the walk - never a short page.
-    for (let page = 0; page < ADDRESS_TXS_MAX_PAGES; page++) {
+    // instances, 25 on esplora), so only an empty batch or the sinceTs cutoff
+    // end the walk - never a short page or a page count, which would drop the
+    // older part of a busy window for good once the cursor moves past it.
+    for (;;) {
       await this._rateLimitDelay()
       const batch = await this.mempoolApi.getAddressTxs({ address, afterTxid: lastSeenTxid })
       if (!Array.isArray(batch) || !batch.length) break
@@ -573,8 +573,10 @@ class WrkMempoolRack extends TetherWrkBase {
         txs.push(tx)
       }
 
-      lastSeenTxid = batch[batch.length - 1]?.txid
-      if (!lastSeenTxid) break
+      const nextTxid = batch[batch.length - 1]?.txid
+      if (!nextTxid) break
+      if (nextTxid === lastSeenTxid) throw new Error('ERR_ADDRESS_TXS_PAGINATION')
+      lastSeenTxid = nextTxid
     }
 
     return txs
@@ -656,13 +658,14 @@ class WrkMempoolRack extends TetherWrkBase {
     // later run picks up from the last successful one. An address added later
     // starts from the current cursor the same way - forward only.
     if (!Number.isFinite(state.lastSyncedTs)) {
-      await this._setRebatesSyncState({ lastSyncedTs: now, lastRunTs: now })
+      await this._setRebatesSyncState({ startTs: now, lastSyncedTs: now, lastRunTs: now })
       return { added: 0, firstRun: true }
     }
 
     // Windows overlap so a run close to the previous cutoff can never miss a
-    // block; txid dedup makes the re-scanned span harmless.
-    const sinceTs = state.lastSyncedTs - REBATES_SYNC_OVERLAP_MS
+    // block; txid dedup makes the re-scanned span harmless. The overlap never
+    // reaches back past the deployment moment.
+    const sinceTs = Math.max(state.lastSyncedTs - REBATES_SYNC_OVERLAP_MS, state.startTs || 0)
     const known = new Set((await this._readRebatesRows(POOL_REBATES_BEE)).map((row) => row.txid))
     const tombstones = new Set((await this._readRebatesRows(POOL_REBATES_DELETED_BEE)).map((row) => row.txid))
 
@@ -682,7 +685,7 @@ class WrkMempoolRack extends TetherWrkBase {
       }
     }
 
-    await this._setRebatesSyncState({ lastSyncedTs: now, lastRunTs: now })
+    await this._setRebatesSyncState({ startTs: state.startTs, lastSyncedTs: now, lastRunTs: now })
     return { added, firstRun: false }
   }
 
