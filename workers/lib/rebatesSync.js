@@ -2,11 +2,12 @@
 
 const { BTC_SATS } = require('./constants')
 
-// The configured addresses are one wallet. Every confirmed transaction paying
-// any of them is a single rebate for the total it paid the wallet, except
-// transactions that also spend from the wallet: change from our own outgoing
-// transfers and moves between our own addresses look like incoming payments
-// but are not rebates. One row per txid, whichever addresses it touched.
+// Each configured address belongs to one site phase, so a rebate is
+// attributed per receiving address: one row per (txid, address), holding the
+// amount that address received. Transactions that also spend from any of the
+// addresses are still judged against all of them as one estate - change from
+// our own outgoing transfers and moves between our own addresses look like
+// incoming payments but are not rebates.
 function extractRebates (txs, addresses) {
   const addressSet = new Set(Array.isArray(addresses) ? addresses : [addresses])
   const rebates = []
@@ -15,28 +16,29 @@ function extractRebates (txs, addresses) {
   for (const tx of Array.isArray(txs) ? txs : []) {
     if (!tx?.txid || !tx.status?.confirmed || !Number.isFinite(tx.status.block_time)) continue
     if (seen.has(tx.txid)) continue
+    seen.add(tx.txid)
 
     const inputs = Array.isArray(tx.vin) ? tx.vin : []
     if (inputs.some((vin) => addressSet.has(vin?.prevout?.scriptpubkey_address))) continue
 
-    const ours = (Array.isArray(tx.vout) ? tx.vout : [])
-      .filter((vout) => addressSet.has(vout?.scriptpubkey_address) && Number(vout.value) > 0)
-    if (!ours.length) continue
+    const satsByAddress = new Map()
+    for (const vout of Array.isArray(tx.vout) ? tx.vout : []) {
+      const address = vout?.scriptpubkey_address
+      if (!addressSet.has(address) || !(Number(vout.value) > 0)) continue
+      satsByAddress.set(address, (satsByAddress.get(address) || 0) + Number(vout.value))
+    }
 
-    const sats = ours.reduce((sum, vout) => sum + (Number(vout.value) || 0), 0)
-    // The row holds one receiver; for a transaction split across our
-    // addresses, the one that received the largest share represents it.
-    const top = ours.reduce((best, vout) => (Number(vout.value) > Number(best.value) ? vout : best), ours[0])
-
-    seen.add(tx.txid)
-    rebates.push({
-      ts: tx.status.block_time * 1000,
-      amountBTC: sats / BTC_SATS,
-      txid: tx.txid,
-      sender: inputs.find((vin) => vin?.prevout?.scriptpubkey_address)?.prevout.scriptpubkey_address,
-      receiver: top.scriptpubkey_address,
-      source: 'auto'
-    })
+    const sender = inputs.find((vin) => vin?.prevout?.scriptpubkey_address)?.prevout.scriptpubkey_address
+    for (const [receiver, sats] of satsByAddress) {
+      rebates.push({
+        ts: tx.status.block_time * 1000,
+        amountBTC: sats / BTC_SATS,
+        txid: tx.txid,
+        sender,
+        receiver,
+        source: 'auto'
+      })
+    }
   }
 
   return rebates

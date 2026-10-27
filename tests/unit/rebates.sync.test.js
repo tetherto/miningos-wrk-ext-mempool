@@ -63,6 +63,20 @@ test('extractRebates sums multiple outputs paying the address', (t) => {
   t.is(rebates[0].amountBTC, 1.25)
 })
 
+test('extractRebates emits one row per receiving address of a tx', (t) => {
+  const rebates = extractRebates([
+    tx({
+      txid: TXID_A,
+      vin: [inputFrom('bc1qsender')],
+      vout: [outputTo(ADDRESS, 50000000), outputTo(ADDRESS_2, 20000000), outputTo(ADDRESS_2, 10000000)]
+    })
+  ], [ADDRESS, ADDRESS_2])
+
+  t.alike(rebates.map((r) => [r.receiver, r.amountBTC]), [[ADDRESS, 0.5], [ADDRESS_2, 0.3]],
+    'each address keeps its own summed share of the transaction')
+  t.ok(rebates.every((r) => r.txid === TXID_A && r.sender === 'bc1qsender'))
+})
+
 test('extractRebates picks any one sender on multi-input txs', (t) => {
   const rebates = extractRebates([
     tx({
@@ -169,7 +183,7 @@ const makeWrk = ({ addresses = [ADDRESS], syncCron, txsByAddress = {}, bucketPri
       put: async (k, v) => { rows.set(k, v) },
       del: async (k) => { rows.delete(k) },
       createReadStream: () => (async function * () {
-        for (const v of rows.values()) yield { value: Buffer.from(v) }
+        for (const [k, v] of rows.entries()) yield { key: k, value: Buffer.from(v) }
       })()
     }
   }
@@ -530,7 +544,7 @@ test('setWrkExtData update rejects a timestamp past the store key range', async 
 
 // --- multiple configured addresses -------------------------------------------
 
-test('a tx paying several configured addresses becomes one rebate for the full amount', async (t) => {
+test('a tx paying several configured addresses becomes one rebate per address', async (t) => {
   const sharedTx = tx({
     txid: TXID_A,
     vin: [inputFrom('bc1qpool')],
@@ -545,10 +559,67 @@ test('a tx paying several configured addresses becomes one rebate for the full a
 
   const out = await wrk.runRebatesSync({})
 
-  t.is(out.added, 1)
+  // Each address belongs to a different site phase, so each keeps its own
+  // share under its own row - nothing dropped, nothing lumped together.
+  t.is(out.added, 2)
+  const rows = (await storedRebates(wrk)).sort((a, b) => b.amountBTC - a.amountBTC)
+  t.alike(rows.map((r) => [r.receiver, r.amountBTC]), [[ADDRESS, 0.5], [ADDRESS_2, 0.3]])
+  t.ok(rows.every((r) => r.txid === TXID_A))
+})
+
+test('deleting a txid removes every per-address row and blocks their re-sync', async (t) => {
+  const sharedTx = tx({
+    txid: TXID_A,
+    vin: [inputFrom('bc1qpool')],
+    vout: [outputTo(ADDRESS, 50000000), outputTo(ADDRESS_2, 30000000)]
+  })
+  const wrk = makeWrk({
+    addresses: [ADDRESS, ADDRESS_2],
+    txsByAddress: { [ADDRESS]: [sharedTx], [ADDRESS_2]: [sharedTx] }
+  })
+  await wrk._setRebatesSyncState({ lastSyncedTs: 1, lastRunTs: 0 })
+  await wrk.runRebatesSync({})
+
+  await wrk.setWrkExtData({ key: POOL_REBATES_DELETE_KEY, value: { txid: TXID_A } })
+  t.is((await storedRebates(wrk)).length, 0, 'both halves of the transaction are gone')
+
+  await wrk._setRebatesSyncState({ lastSyncedTs: 1, lastRunTs: 0 })
+  const out = await wrk.runRebatesSync({})
+  t.is(out.added, 0, 'the tombstone covers the whole transaction')
+})
+
+test('setWrkExtData update addresses one per-address row by txid and receiver', async (t) => {
+  const wrk = makeWrk()
+  await wrk._putRebatesKeyedRow(POOL_REBATES_BEE, `${TXID_A}:${ADDRESS}`, {
+    txid: TXID_A, ts: REBATE_TS, amountBTC: 0.5, receiver: ADDRESS, source: 'auto'
+  })
+  await wrk._putRebatesKeyedRow(POOL_REBATES_BEE, `${TXID_A}:${ADDRESS_2}`, {
+    txid: TXID_A, ts: REBATE_TS, amountBTC: 0.3, receiver: ADDRESS_2, source: 'auto'
+  })
+
+  await wrk.setWrkExtData({
+    key: POOL_REBATES_UPDATE_KEY,
+    value: { txid: TXID_A, ts: REBATE_TS, amountBTC: 0.25, receiver: ADDRESS_2 }
+  })
+
+  const rows = (await storedRebates(wrk)).sort((a, b) => b.amountBTC - a.amountBTC)
+  t.alike(rows.map((r) => [r.receiver, r.amountBTC]), [[ADDRESS, 0.5], [ADDRESS_2, 0.25]],
+    'only the addressed half changes')
+})
+
+test('setWrkExtData update falls back to the single row of a txid when receiver is edited', async (t) => {
+  const wrk = makeWrk()
+  await wrk._putRebatesKeyedRow(POOL_REBATES_BEE, `${TXID_A}:${ADDRESS}`, {
+    txid: TXID_A, ts: REBATE_TS, amountBTC: 0.5, receiver: ADDRESS, source: 'auto'
+  })
+
+  await wrk.setWrkExtData({
+    key: POOL_REBATES_UPDATE_KEY,
+    value: { txid: TXID_A, ts: REBATE_TS, amountBTC: 0.5, receiver: 'bc1qcorrected' }
+  })
+
   const [row] = await storedRebates(wrk)
-  t.is(row.amountBTC, 0.8, 'the wallet received 0.8, not just the first address\'s share')
-  t.is(row.receiver, ADDRESS, 'represented by the address with the largest share')
+  t.is(row.receiver, 'bc1qcorrected', 'a receiver correction still finds the row')
 })
 
 test('a transfer between two configured addresses is not a rebate', async (t) => {

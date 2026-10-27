@@ -605,10 +605,41 @@ class WrkMempoolRack extends TetherWrkBase {
     return rows
   }
 
+  // A row is keyed txid:receiver so a transaction paying several configured
+  // addresses holds one row per address; rows written before per-address
+  // attribution sit under the bare txid and stay readable in place.
   async _deleteRebateRow (txid) {
     const db = await this._getBee(POOL_REBATES_BEE)
-    await db.del(txid)
+    const keys = []
+    for await (const entry of db.createReadStream()) {
+      const row = JSON.parse(entry.value.toString())
+      if (row?.txid === txid) keys.push(entry.key.toString())
+    }
+    for (const key of keys) await db.del(key)
     await db.close()
+  }
+
+  // The row a txid refers to: the bare-txid key (legacy rows), the
+  // txid:receiver key, or - since receiver may itself be the edited field -
+  // the single stored row of that transaction, unambiguous without it.
+  async _findRebateRow (txid, receiver) {
+    const direct = await this._getRebatesKeyedRow(POOL_REBATES_BEE, txid)
+    if (direct) return { key: txid, row: direct }
+
+    if (receiver) {
+      const key = `${txid}:${receiver}`
+      const keyed = await this._getRebatesKeyedRow(POOL_REBATES_BEE, key)
+      if (keyed) return { key, row: keyed }
+    }
+
+    const db = await this._getBee(POOL_REBATES_BEE)
+    const matches = []
+    for await (const entry of db.createReadStream()) {
+      const row = JSON.parse(entry.value.toString())
+      if (row?.txid === txid) matches.push({ key: entry.key.toString(), row })
+    }
+    await db.close()
+    return matches.length === 1 ? matches[0] : null
   }
 
   async _getRebatesSyncState () {
@@ -666,13 +697,20 @@ class WrkMempoolRack extends TetherWrkBase {
     // block; txid dedup makes the re-scanned span harmless. The overlap never
     // reaches back past the deployment moment.
     const sinceTs = Math.max(state.lastSyncedTs - REBATES_SYNC_OVERLAP_MS, state.startTs || 0)
-    const known = new Set((await this._readRebatesRows(POOL_REBATES_BEE)).map((row) => row.txid))
+    // A stored row marks its own (txid, receiver) as known; a row without a
+    // receiver (written before per-address attribution) blocks the whole
+    // transaction, so an old one-wallet row is never retro-split.
+    const known = new Set()
+    for (const row of await this._readRebatesRows(POOL_REBATES_BEE)) {
+      known.add(row.receiver ? `${row.txid}:${row.receiver}` : row.txid)
+    }
     const tombstones = new Set((await this._readRebatesRows(POOL_REBATES_DELETED_BEE)).map((row) => row.txid))
 
     // All addresses are scanned before extraction so a transaction touching
-    // several of them is judged against the whole wallet: its amounts sum into
-    // one row, and a move between our own addresses is recognized as internal
-    // rather than counted as a rebate at the destination.
+    // several of them is judged against all of them at once: each address's
+    // amounts land in its own row, and a move between our own addresses is
+    // recognized as internal rather than counted as a rebate at the
+    // destination.
     const txsById = new Map()
     for (const address of addresses) {
       for (const tx of await this._getAddressTxs({ address, sinceTs })) {
@@ -682,14 +720,15 @@ class WrkMempoolRack extends TetherWrkBase {
 
     let added = 0
     for (const rebate of extractRebates([...txsById.values()], addresses)) {
-      if (known.has(rebate.txid) || tombstones.has(rebate.txid)) continue
+      const rowKey = `${rebate.txid}:${rebate.receiver}`
+      if (known.has(rowKey) || known.has(rebate.txid) || tombstones.has(rebate.txid)) continue
       const priceUSD = await this._getReceiptPriceUSD(rebate.ts)
       await this._putRebatesKeyedRow(
         POOL_REBATES_BEE,
-        rebate.txid,
+        rowKey,
         priceUSD ? { ...rebate, priceUSD } : rebate
       )
-      known.add(rebate.txid)
+      known.add(rowKey)
       added++
     }
 
@@ -762,11 +801,11 @@ class WrkMempoolRack extends TetherWrkBase {
       if (!Number.isInteger(ts) || ts <= 0 || !this._isValidBeeTs(ts)) throw new Error('ERR_INVALID_TS')
       if (!Number.isFinite(amountBTC) || amountBTC <= 0) throw new Error('ERR_INVALID_AMOUNT')
 
-      const existing = await this._getRebatesKeyedRow(POOL_REBATES_BEE, txid)
-      if (!existing) throw new Error('ERR_REBATE_NOT_FOUND')
+      const found = await this._findRebateRow(txid, receiver)
+      if (!found) throw new Error('ERR_REBATE_NOT_FOUND')
 
-      const next = { ...existing, ts, amountBTC, sender, receiver }
-      if (ts !== existing.ts) {
+      const next = { ...found.row, ts, amountBTC, sender, receiver }
+      if (ts !== found.row.ts) {
         // The stored price belongs to the old moment. Re-derive from the local
         // bucket store only - this serves an RPC, so no upstream call budget;
         // an unknown bucket leaves the row unpriced and the read path falls
@@ -774,7 +813,7 @@ class WrkMempoolRack extends TetherWrkBase {
         const bucket = await this._getPriceBucket(priceBucket(ts))
         next.priceUSD = bucket?.priceUSD || undefined
       }
-      await this._putRebatesKeyedRow(POOL_REBATES_BEE, txid, next)
+      await this._putRebatesKeyedRow(POOL_REBATES_BEE, found.key, next)
       return true
     }
 
