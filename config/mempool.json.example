@@ -1,5 +1,5 @@
 {
-    "baseUrl": "https://mempool.bitcoin-21.org/api",
+    "baseUrl": "https://mempool.space/api",
     "dataFetchIntervalMs": 1800000,
     "historicalDataFetchIntervalMs": 43200000,
     "priceSampleIntervalMs": 300000,
