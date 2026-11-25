@@ -12,6 +12,16 @@ const {
   HISTORICAL_PRICES_DATA_KEY,
   STAT_BLOCKSIZES,
   HISTORICAL_BLOCKSIZES_DATA_KEY,
+  STAT_BLOCK_STATS_1H,
+  HISTORICAL_BLOCK_STATS_DATA_KEY,
+  BLOCK_STATS_START_TS,
+  BLOCK_STATS_SYNC_BEE,
+  BLOCK_STATS_SYNC_INTERVAL_MS,
+  BLOCK_STATS_CONFIRMATIONS,
+  BLOCK_STATS_PAGE_SIZE,
+  BLOCK_STATS_BACKFILL_CHUNK_PAGES,
+  BLOCK_STATS_SKIPPED_RETRY_MS,
+  BLOCK_STATS_MAX_SKIPPED_PER_PAGE,
   STAT_HASHRATE_HISTORY,
   HISTORICAL_HASHRATE_DATA_KEY,
   HISTORICAL_DATA_START_TS,
@@ -32,6 +42,16 @@ const {
   HTTP_STATUS_TOO_MANY_REQUESTS
 } = require('./lib/constants')
 const { extractRebates, parseSyncCron, lastCronFire } = require('./lib/rebatesSync')
+const {
+  hourBucket,
+  toBlockStat,
+  pickBlocks,
+  groupByHour,
+  addBlocksToRow,
+  addLateBlockToRow,
+  isBlockUnservable,
+  isPageUnusable
+} = require('./lib/blockStats')
 const { getUTCMidnightTimestampsSince, priceBucket } = require('./lib/utils')
 const utilsStore = require('@tetherto/hp-svc-facs-store/utils')
 const gLibUtilBase = require('@bitfinex/lib-js-util-base')
@@ -133,6 +153,13 @@ class WrkMempoolRack extends TetherWrkBase {
           REBATES_SYNC_TICK_MS
         )
         this.maybeRunRebatesSync()
+
+        this.interval_mempool.add(
+          'block-stats-sync',
+          this.syncBlockStats.bind(this),
+          BLOCK_STATS_SYNC_INTERVAL_MS
+        )
+        this.syncBlockStats()
       }
     ], cb)
   }
@@ -341,6 +368,186 @@ class WrkMempoolRack extends TetherWrkBase {
     return timestamps.filter((ts) => !stored.has(ts))
   }
 
+  async _getBlockStatsState () {
+    return (await this._getRebatesKeyedRow(BLOCK_STATS_SYNC_BEE, 'state')) ?? {}
+  }
+
+  async _setBlockStatsState (state) {
+    await this._putRebatesKeyedRow(BLOCK_STATS_SYNC_BEE, 'state', state)
+  }
+
+  async _addBlockStats (blocks) {
+    const statKey = `${STAT_BLOCK_STATS_1H}-${MEMPOOL_TAG}`
+    for (const [ts, hourBlocks] of groupByHour(blocks)) {
+      const row = await this._getDbRow(statKey, ts)
+      await this._saveToDbKey(statKey, ts, addBlocksToRow(row, ts, hourBlocks))
+    }
+  }
+
+  // Blocks `from..to`, oldest first. Normally one page; a page upstream
+  // cannot produce is re-read block by block, so a single block its index is
+  // broken for costs that block rather than stalling the walk at its page
+  // forever. Such a block comes back in `skipped` and is retried later. More
+  // than a few in one page is upstream being unwell, not broken blocks, and
+  // nothing is skipped over that.
+  async _getBlockStatsRange (from, to) {
+    const api = this.mempoolApi
+    try {
+      const blocks = pickBlocks(await this._apiCall(api.getBlocks, api, to), from, to)
+      return { blocks, skipped: [], from: blocks[0].height }
+    } catch (err) {
+      if (!isPageUnusable(err)) throw err
+    }
+
+    // The forward walk narrows its page size on the way to a hole; whatever
+    // it settled on described the hole, not what upstream serves.
+    this._blockStatsPageSize = undefined
+
+    const blocks = []
+    const skipped = []
+    for (let height = from; height <= to; height++) {
+      const block = await this._getBlockStat(height)
+      if (block) blocks.push(block)
+      else skipped.push(height)
+      if (skipped.length > BLOCK_STATS_MAX_SKIPPED_PER_PAGE) throw new Error('ERR_BLOCK_STATS_UPSTREAM_UNHEALTHY')
+    }
+    return { blocks, skipped, from }
+  }
+
+  // Null only when upstream knows the height and still cannot serve the
+  // block; anything else throws and the run is retried.
+  async _getBlockStat (height) {
+    const api = this.mempoolApi
+    const hash = await this._apiCall(api.getBlockHash, api, height)
+    try {
+      const block = toBlockStat(await this._apiCall(api.getBlock, api, hash))
+      if (block.height !== height) throw new Error('ERR_BLOCK_STATS_HEIGHT_MISMATCH')
+      return block
+    } catch (err) {
+      if (!isBlockUnservable(err)) throw err
+      console.error(new Date().toISOString(), `ERR_BLOCK_STATS_BLOCK_UNAVAILABLE height=${height}`)
+      return null
+    }
+  }
+
+  _withSkippedBlocks (state, heights, now = Date.now()) {
+    if (!heights.length) return state
+    const skipped = { ...state.skipped }
+    for (const height of heights) skipped[height] = now + BLOCK_STATS_SKIPPED_RETRY_MS
+    return { ...state, skipped }
+  }
+
+  // Skipped blocks get another try once their wait is over, and join their
+  // hour as soon as upstream can serve them.
+  async _retrySkippedBlockStats (state, now = Date.now()) {
+    const statKey = `${STAT_BLOCK_STATS_1H}-${MEMPOOL_TAG}`
+
+    for (const height of Object.keys(state.skipped || {}).map(Number)) {
+      if (state.skipped[height] > now || this._isApiThrottled()) continue
+
+      const block = await this._getBlockStat(height)
+      if (!block) {
+        state = this._withSkippedBlocks(state, [height], now)
+      } else {
+        if (block.ts >= BLOCK_STATS_START_TS) {
+          const ts = hourBucket(block.ts)
+          const row = await this._getDbRow(statKey, ts)
+          await this._saveToDbKey(statKey, ts, addLateBlockToRow(row, ts, block))
+        }
+        const { [height]: done, ...skipped } = state.skipped
+        state = { ...state, skipped }
+      }
+      await this._setBlockStatsState(state)
+    }
+
+    return state
+  }
+
+  _isBlockStatsBackfilled (state) {
+    return Number.isFinite(state.backfilledToTs) && state.backfilledToTs <= BLOCK_STATS_START_TS
+  }
+
+  // New blocks, oldest first, up to a few confirmations behind the tip: a
+  // block is only added once it can no longer be reorganised away, since a
+  // row is a running sum and cannot take a block back out.
+  async _syncBlockStatsForward (state) {
+    const api = this.mempoolApi
+    const tip = await this._apiCall(api.getBlockHeight, api)
+    if (!Number.isInteger(tip)) throw new Error('ERR_BLOCK_STATS_TIP')
+    const target = tip - BLOCK_STATS_CONFIRMATIONS
+
+    if (!Number.isInteger(state.maxHeight) || !Number.isInteger(state.minHeight)) {
+      state = { ...state, minHeight: target + 1, maxHeight: target }
+      await this._setBlockStatsState(state)
+    }
+
+    while (state.maxHeight < target && !this._isApiThrottled()) {
+      const pageSize = this._blockStatsPageSize || BLOCK_STATS_PAGE_SIZE
+      const from = state.maxHeight + 1
+      const to = Math.min(state.maxHeight + pageSize, target)
+      const range = await this._getBlockStatsRange(from, to)
+
+      // Upstream returned a shorter page than assumed: nothing is stored from
+      // it, and the walk carries on at the size it actually serves.
+      if (range.from > from) {
+        this._blockStatsPageSize = range.blocks.length
+        continue
+      }
+
+      await this._addBlockStats(range.blocks)
+      state = this._withSkippedBlocks({ ...state, maxHeight: to }, range.skipped)
+      await this._setBlockStatsState(state)
+    }
+
+    return state
+  }
+
+  // History, newest first, down to BLOCK_STATS_START_TS. Bounded per call so
+  // the forward walk gets a turn in between and today's hours keep filling
+  // while months of history are still being fetched.
+  async _syncBlockStatsBackward (state, maxPages) {
+    for (let page = 0; page < maxPages; page++) {
+      if (this._isBlockStatsBackfilled(state) || this._isApiThrottled()) break
+      const pageSize = this._blockStatsPageSize || BLOCK_STATS_PAGE_SIZE
+
+      const to = state.minHeight - 1
+      if (to < 0) {
+        state = { ...state, backfilledToTs: BLOCK_STATS_START_TS }
+        await this._setBlockStatsState(state)
+        break
+      }
+
+      const range = await this._getBlockStatsRange(Math.max(to - pageSize + 1, 0), to)
+      const wanted = range.blocks.filter((block) => block.ts >= BLOCK_STATS_START_TS)
+      await this._addBlockStats(wanted)
+
+      state = this._withSkippedBlocks({ ...state, minHeight: range.from }, range.skipped)
+      if (wanted.length < range.blocks.length) state.backfilledToTs = BLOCK_STATS_START_TS
+      await this._setBlockStatsState(state)
+    }
+
+    return state
+  }
+
+  async syncBlockStats () {
+    if (this._blockStatsSyncRunning) return
+    this._blockStatsSyncRunning = true
+
+    try {
+      let state = await this._getBlockStatsState()
+      for (;;) {
+        state = await this._syncBlockStatsForward(state)
+        state = await this._retrySkippedBlockStats(state)
+        if (this._isBlockStatsBackfilled(state) || this._isApiThrottled()) break
+        state = await this._syncBlockStatsBackward(state, BLOCK_STATS_BACKFILL_CHUNK_PAGES)
+      }
+    } catch (error) {
+      console.error(new Date().toISOString(), 'ERR_BLOCK_STATS_SYNC', error)
+    } finally {
+      this._blockStatsSyncRunning = false
+    }
+  }
+
   async saveHistoricalPrices () {
     if (this.fetchingHistoricalPricesData) return
     this.fetchingHistoricalPricesData = true
@@ -498,6 +705,13 @@ class WrkMempoolRack extends TetherWrkBase {
     await db.close()
   }
 
+  async _getDbRow (key, ts) {
+    const db = await this._getBee(key)
+    const entry = await db.get(utilsStore.convIntToBin(ts))
+    await db.close()
+    return entry ? JSON.parse(entry.value.toString()) : null
+  }
+
   async _getDbData (key, { start, end, limit = 100 }) {
     const db = await this._getBee(key)
     const stream = db.createReadStream({
@@ -584,6 +798,7 @@ class WrkMempoolRack extends TetherWrkBase {
 
   _getHistoricalExtDataLogKey (key) {
     if (key === HISTORICAL_BLOCKSIZES_DATA_KEY) return STAT_BLOCKSIZES
+    if (key === HISTORICAL_BLOCK_STATS_DATA_KEY) return STAT_BLOCK_STATS_1H
     if (key === HISTORICAL_HASHRATE_DATA_KEY) return STAT_HASHRATE_HISTORY
     if (key === HISTORICAL_PRICES_DATA_KEY) return STAT_PRICES
   }
@@ -868,7 +1083,12 @@ class WrkMempoolRack extends TetherWrkBase {
       return await this.getPricesAtTimestamps(args.query)
     }
 
-    if ([HISTORICAL_PRICES_DATA_KEY, HISTORICAL_BLOCKSIZES_DATA_KEY, HISTORICAL_HASHRATE_DATA_KEY].includes(args.query?.key)) {
+    if ([
+      HISTORICAL_PRICES_DATA_KEY,
+      HISTORICAL_BLOCKSIZES_DATA_KEY,
+      HISTORICAL_BLOCK_STATS_DATA_KEY,
+      HISTORICAL_HASHRATE_DATA_KEY
+    ].includes(args.query?.key)) {
       const key = `${this._getHistoricalExtDataLogKey(args.query.key)}-${MEMPOOL_TAG}`
       return await this._getDbData(key, args.query)
     }

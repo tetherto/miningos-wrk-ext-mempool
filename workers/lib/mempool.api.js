@@ -49,6 +49,18 @@ class MempoolApi {
     return await this._request(`/v1/block/${hash}`)
   }
 
+  async getBlockHash (height) {
+    const { body } = await this._http.get(`/block-height/${height}`, { encoding: 'text' })
+    const hash = String(body).trim()
+    if (!/^[0-9a-f]{64}$/.test(hash)) throw new Error('ERR_BLOCK_HASH_INVALID')
+    return hash
+  }
+
+  // Extended blocks, newest first, from `height` downwards.
+  async getBlocks (height) {
+    return await this._request(`/v1/blocks/${height}`)
+  }
+
   // The esplora-style /txs/chain/:txid route is not served by electrum-backed
   // mempool instances (our self-hosted upstream 404s on it); the after_txid
   // query form paginates on both backends.
